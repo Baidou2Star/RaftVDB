@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package raftvdb.proto;
+
+// T-01 keeps the schema intentionally tiny so we can validate protobuf and
+// gRPC code generation before the full Raft API is introduced in T-12.
+message Empty {}
+
+service BootstrapService {
+  rpc Ping(Empty) returns (Empty);
+}

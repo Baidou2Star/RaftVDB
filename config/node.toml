@@ -1,0 +1,36 @@
+# RaftVDB node configuration template used during early project bootstrap.
+# The values are intentionally conservative so local single-node bring-up is
+# easy before the full cluster logic lands in later tasks.
+
+[cluster]
+node_id = "node-1"
+listen_host = "127.0.0.1"
+listen_port = 50051
+peers = []
+
+[raft]
+heartbeat_interval_ms = 150
+election_timeout_min_ms = 300
+election_timeout_max_ms = 600
+lease_duration_ms = 250
+clock_drift_bound_ms = 50
+snapshot_threshold = 10000
+pipeline_window_size = 16
+batch_max_entries = 64
+batch_flush_interval_us = 500
+mentor_ack_timeout_ms = 200
+mentor_recover_timeout_ms = 1000
+topology_refresh_interval_ms = 5000
+
+[vector]
+dimension = 768
+metric = "cos"
+scalar_kind = "f32"
+initial_capacity = 10000
+
+[storage]
+data_dir = "data/node-1"
+wal_segment_size_mb = 128
+
+[logging]
+level = "info"

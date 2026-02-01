@@ -1,0 +1,35 @@
+# Build output
+build/
+Build/
+build-*/
+
+# Runtime data
+data/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Makefile
+install_manifest.txt
+
+# Compiler output
+*.a
+*.d
+*.dll
+*.dylib
+*.exe
+*.lib
+*.o
+*.obj
+*.out
+*.pdb
+*.so
+*.so.*
+
+# Temporary files
+*.bak
+*.log
+*.swp
+*.tmp
