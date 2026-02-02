@@ -22,6 +22,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
+include(CTest)
 
 find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
@@ -98,3 +99,10 @@ target_link_libraries(raftvdb-bench
         spdlog::spdlog
         tomlplusplus::tomlplusplus
 )
+
+if(BUILD_TESTING)
+    add_executable(raftvdb-test-common
+        tests/unit/test_result_defer.cpp
+    )
+    add_test(NAME raftvdb-test-common COMMAND raftvdb-test-common)
+endif()
