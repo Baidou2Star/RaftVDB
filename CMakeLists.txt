@@ -76,11 +76,20 @@ target_link_libraries(raftvdb_proto
         gRPC::grpc++
 )
 
+add_library(raftvdb_common STATIC
+    src/common/config.cpp
+)
+target_link_libraries(raftvdb_common
+    PUBLIC
+        tomlplusplus::tomlplusplus
+)
+
 add_executable(raftvdb-node
     cmd/node/main.cpp
 )
 target_link_libraries(raftvdb-node
     PRIVATE
+        raftvdb_common
         raftvdb_proto
         usearch
         Boost::system
@@ -93,6 +102,7 @@ add_executable(raftvdb-bench
 )
 target_link_libraries(raftvdb-bench
     PRIVATE
+        raftvdb_common
         raftvdb_proto
         usearch
         Boost::system
@@ -105,4 +115,13 @@ if(BUILD_TESTING)
         tests/unit/test_result_defer.cpp
     )
     add_test(NAME raftvdb-test-common COMMAND raftvdb-test-common)
+
+    add_executable(raftvdb-test-config
+        tests/unit/test_config.cpp
+    )
+    target_link_libraries(raftvdb-test-config
+        PRIVATE
+            raftvdb_common
+    )
+    add_test(NAME raftvdb-test-config COMMAND raftvdb-test-config)
 endif()
