@@ -45,6 +45,9 @@ max_retry_count = 10
 [server]
 grpc_port = 7001
 
+[logging]
+level = "info"
+
 [storage]
 raft_log_dir = "./data/raft"
 snapshot_dir = "./data/snapshot"

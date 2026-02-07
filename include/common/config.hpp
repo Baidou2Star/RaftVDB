@@ -59,6 +59,10 @@ struct StorageConfig {
     std::string snapshot_dir = "./data/snapshot";
 };
 
+struct LoggingConfig {
+    std::string level = "info";
+};
+
 struct Config {
     ClusterConfig cluster;
     RaftConfig raft;
@@ -67,6 +71,7 @@ struct Config {
     ClientConfig client;
     ServerConfig server;
     StorageConfig storage;
+    LoggingConfig logging;
 
     static Result<Config> LoadFromFile(const std::string& path);
 

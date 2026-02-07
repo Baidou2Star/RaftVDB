@@ -78,9 +78,11 @@ target_link_libraries(raftvdb_proto
 
 add_library(raftvdb_common STATIC
     src/common/config.cpp
+    src/common/logger.cpp
 )
 target_link_libraries(raftvdb_common
     PUBLIC
+        spdlog::spdlog
         tomlplusplus::tomlplusplus
 )
 
@@ -124,4 +126,13 @@ if(BUILD_TESTING)
             raftvdb_common
     )
     add_test(NAME raftvdb-test-config COMMAND raftvdb-test-config)
+
+    add_executable(raftvdb-test-logger
+        tests/unit/test_logger.cpp
+    )
+    target_link_libraries(raftvdb-test-logger
+        PRIVATE
+            raftvdb_common
+    )
+    add_test(NAME raftvdb-test-logger COMMAND raftvdb-test-logger)
 endif()

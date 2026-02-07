@@ -203,6 +203,18 @@ Result<void> ValidateStorageConfig(const StorageConfig& cfg) {
     return Result<void>::Ok();
 }
 
+Result<void> ValidateLoggingConfig(const LoggingConfig& cfg) {
+    const auto normalized = ToLower(cfg.level);
+    if (normalized == "trace" || normalized == "debug" || normalized == "info" ||
+        normalized == "warn" || normalized == "warning" || normalized == "error" ||
+        normalized == "err" || normalized == "critical" || normalized == "off") {
+        return Result<void>::Ok();
+    }
+
+    return Result<void>::Err(
+        "logging.level 仅支持 trace/debug/info/warn/error/critical/off");
+}
+
 } // namespace
 
 Result<void> ValidateLeaseConfig(const RaftConfig& cfg) {
@@ -388,6 +400,13 @@ Result<Config> Config::LoadFromFile(const std::string& path) {
         }
         cfg.server.grpc_port = *grpc_port;
 
+        auto logging_level =
+            ReadOptionalValue<std::string>(table, "logging.level", cfg.logging.level);
+        if (!logging_level) {
+            return Result<Config>::Err(logging_level.error);
+        }
+        cfg.logging.level = ToLower(*logging_level);
+
         auto raft_log_dir = TryReadValue<std::string>(table, "storage.raft_log_dir");
         auto snapshot_dir = TryReadValue<std::string>(table, "storage.snapshot_dir");
         auto data_dir = TryReadValue<std::string>(table, "storage.data_dir");
@@ -446,6 +465,11 @@ Result<Config> Config::LoadFromFile(const std::string& path) {
         auto storage_validation = ValidateStorageConfig(cfg.storage);
         if (!storage_validation) {
             return Result<Config>::Err(storage_validation.error);
+        }
+
+        auto logging_validation = ValidateLoggingConfig(cfg.logging);
+        if (!logging_validation) {
+            return Result<Config>::Err(logging_validation.error);
         }
 
         return Result<Config>::Ok(std::move(cfg));
