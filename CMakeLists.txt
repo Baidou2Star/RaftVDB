@@ -86,12 +86,21 @@ target_link_libraries(raftvdb_common
         tomlplusplus::tomlplusplus
 )
 
+add_library(raftvdb_raft STATIC
+    src/raft/log_entry.cpp
+)
+target_link_libraries(raftvdb_raft
+    PUBLIC
+        raftvdb_proto
+)
+
 add_executable(raftvdb-node
     cmd/node/main.cpp
 )
 target_link_libraries(raftvdb-node
     PRIVATE
         raftvdb_common
+        raftvdb_raft
         raftvdb_proto
         usearch
         Boost::system
@@ -105,6 +114,7 @@ add_executable(raftvdb-bench
 target_link_libraries(raftvdb-bench
     PRIVATE
         raftvdb_common
+        raftvdb_raft
         raftvdb_proto
         usearch
         Boost::system
@@ -135,4 +145,13 @@ if(BUILD_TESTING)
             raftvdb_common
     )
     add_test(NAME raftvdb-test-logger COMMAND raftvdb-test-logger)
+
+    add_executable(raftvdb-test-log-entry
+        tests/unit/test_log_entry.cpp
+    )
+    target_link_libraries(raftvdb-test-log-entry
+        PRIVATE
+            raftvdb_raft
+    )
+    add_test(NAME raftvdb-test-log-entry COMMAND raftvdb-test-log-entry)
 endif()

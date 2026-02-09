@@ -2,8 +2,27 @@ syntax = "proto3";
 
 package raftvdb.proto;
 
-// T-01 keeps the schema intentionally tiny so we can validate protobuf and
-// gRPC code generation before the full Raft API is introduced in T-12.
+// T-05 starts introducing the protobuf messages that are already needed by the
+// in-process data model. The remaining Raft RPC surface will be expanded in T-12.
+message UpsertCmd {
+  uint64 id = 1;
+  repeated float vector = 2;
+  string request_id = 3;
+}
+
+message DeleteCmd {
+  uint64 id = 1;
+  string request_id = 2;
+}
+
+message LogEntry {
+  uint64 index = 1;
+  uint64 term = 2;
+  uint32 type = 3;
+  uint32 cmd_type = 4;
+  bytes payload = 5;
+}
+
 message Empty {}
 
 service BootstrapService {
