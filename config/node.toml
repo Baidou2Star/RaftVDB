@@ -51,3 +51,4 @@ level = "info"
 [storage]
 raft_log_dir = "./data/raft"
 snapshot_dir = "./data/snapshot"
+wal_segment_size_mb = 64

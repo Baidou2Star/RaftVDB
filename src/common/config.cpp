@@ -200,6 +200,9 @@ Result<void> ValidateStorageConfig(const StorageConfig& cfg) {
     if (cfg.snapshot_dir.empty()) {
         return Result<void>::Err("storage.snapshot_dir 不能为空");
     }
+    if (cfg.wal_segment_size_mb == 0) {
+        return Result<void>::Err("storage.wal_segment_size_mb 必须大于 0");
+    }
     return Result<void>::Ok();
 }
 
@@ -436,6 +439,12 @@ Result<Config> Config::LoadFromFile(const std::string& path) {
                 cfg.storage.snapshot_dir = (base_dir / "snapshot").string();
             }
         }
+        auto wal_segment_size_mb = ReadOptionalValue<uint32_t>(
+            table, "storage.wal_segment_size_mb", cfg.storage.wal_segment_size_mb);
+        if (!wal_segment_size_mb) {
+            return Result<Config>::Err(wal_segment_size_mb.error);
+        }
+        cfg.storage.wal_segment_size_mb = *wal_segment_size_mb;
 
         auto lease_validation = ValidateLeaseConfig(cfg.raft);
         if (!lease_validation) {

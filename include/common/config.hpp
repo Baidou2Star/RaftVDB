@@ -57,6 +57,7 @@ struct ServerConfig {
 struct StorageConfig {
     std::string raft_log_dir = "./data/raft";
     std::string snapshot_dir = "./data/snapshot";
+    uint32_t wal_segment_size_mb = 64;
 };
 
 struct LoggingConfig {
