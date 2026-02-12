@@ -23,6 +23,11 @@ message LogEntry {
   bytes payload = 5;
 }
 
+message RaftMetaRecord {
+  uint64 current_term = 1;
+  string voted_for = 2;
+}
+
 message Empty {}
 
 service BootstrapService {

@@ -96,11 +96,13 @@ target_link_libraries(raftvdb_raft
 
 add_library(raftvdb_storage STATIC
     src/storage/wal.cpp
+    src/storage/raft_meta.cpp
 )
 target_link_libraries(raftvdb_storage
     PUBLIC
         raftvdb_common
         raftvdb_raft
+        raftvdb_proto
 )
 
 add_executable(raftvdb-node
@@ -174,4 +176,13 @@ if(BUILD_TESTING)
             raftvdb_storage
     )
     add_test(NAME raftvdb-test-wal COMMAND raftvdb-test-wal)
+
+    add_executable(raftvdb-test-raft-meta
+        tests/unit/test_raft_meta.cpp
+    )
+    target_link_libraries(raftvdb-test-raft-meta
+        PRIVATE
+            raftvdb_storage
+    )
+    add_test(NAME raftvdb-test-raft-meta COMMAND raftvdb-test-raft-meta)
 endif()
