@@ -97,6 +97,7 @@ target_link_libraries(raftvdb_raft
 add_library(raftvdb_storage STATIC
     src/storage/wal.cpp
     src/storage/raft_meta.cpp
+    src/storage/snapshot_store.cpp
 )
 target_link_libraries(raftvdb_storage
     PUBLIC
@@ -185,4 +186,13 @@ if(BUILD_TESTING)
             raftvdb_storage
     )
     add_test(NAME raftvdb-test-raft-meta COMMAND raftvdb-test-raft-meta)
+
+    add_executable(raftvdb-test-snapshot-store
+        tests/unit/test_snapshot_store.cpp
+    )
+    target_link_libraries(raftvdb-test-snapshot-store
+        PRIVATE
+            raftvdb_storage
+    )
+    add_test(NAME raftvdb-test-snapshot-store COMMAND raftvdb-test-snapshot-store)
 endif()
