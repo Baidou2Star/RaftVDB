@@ -138,8 +138,8 @@ Result<void> ValidateVectorConfig(const VectorConfig& cfg) {
     if (cfg.initial_capacity == 0) {
         return Result<void>::Err("vector.initial_capacity 必须大于 0");
     }
-    if (cfg.connectivity == 0) {
-        return Result<void>::Err("vector.connectivity 必须大于 0");
+    if (cfg.connectivity < 2) {
+        return Result<void>::Err("vector.connectivity 必须大于等于 2");
     }
     if (cfg.expansion_add == 0 || cfg.expansion_search == 0) {
         return Result<void>::Err("vector 扩展参数必须大于 0");

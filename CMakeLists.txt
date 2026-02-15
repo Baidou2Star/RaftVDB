@@ -106,6 +106,14 @@ target_link_libraries(raftvdb_storage
         raftvdb_proto
 )
 
+add_library(raftvdb_vector STATIC
+    src/vector/vector_index.cpp
+)
+target_link_libraries(raftvdb_vector
+    PUBLIC
+        usearch
+)
+
 add_executable(raftvdb-node
     cmd/node/main.cpp
 )
@@ -114,6 +122,7 @@ target_link_libraries(raftvdb-node
         raftvdb_common
         raftvdb_raft
         raftvdb_storage
+        raftvdb_vector
         raftvdb_proto
         usearch
         Boost::system
@@ -129,6 +138,7 @@ target_link_libraries(raftvdb-bench
         raftvdb_common
         raftvdb_raft
         raftvdb_storage
+        raftvdb_vector
         raftvdb_proto
         usearch
         Boost::system
@@ -195,4 +205,13 @@ if(BUILD_TESTING)
             raftvdb_storage
     )
     add_test(NAME raftvdb-test-snapshot-store COMMAND raftvdb-test-snapshot-store)
+
+    add_executable(raftvdb-test-vector-index
+        tests/unit/test_vector_index.cpp
+    )
+    target_link_libraries(raftvdb-test-vector-index
+        PRIVATE
+            raftvdb_vector
+    )
+    add_test(NAME raftvdb-test-vector-index COMMAND raftvdb-test-vector-index)
 endif()
