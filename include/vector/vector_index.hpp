@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-#include <usearch/index_dense.hpp>
+#include <vector/index_dense.hpp>
 
 #include "common/config.hpp"
 #include "common/result.hpp"

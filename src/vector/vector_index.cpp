@@ -7,7 +7,7 @@
 #include <thread>
 #include <utility>
 
-#include <usearch/index_plugins.hpp>
+#include <vector/index_plugins.hpp>
 
 namespace {
 

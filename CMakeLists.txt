@@ -23,21 +23,16 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 include(CTest)
+add_compile_definitions(
+    USEARCH_USE_FP16LIB=0
+    USEARCH_USE_SIMSIMD=0
+)
 
 find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
 find_package(spdlog CONFIG REQUIRED)
 find_package(tomlplusplus CONFIG REQUIRED)
-
-add_library(usearch INTERFACE)
-target_include_directories(usearch INTERFACE
-    ${CMAKE_SOURCE_DIR}/third_party
-)
-target_compile_definitions(usearch INTERFACE
-    USEARCH_USE_FP16LIB=0
-    USEARCH_USE_SIMSIMD=0
-)
 
 set(RAFTVDB_PROTO_FILE ${CMAKE_SOURCE_DIR}/proto/raft.proto)
 set(RAFTVDB_GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
@@ -109,10 +104,6 @@ target_link_libraries(raftvdb_storage
 add_library(raftvdb_vector STATIC
     src/vector/vector_index.cpp
 )
-target_link_libraries(raftvdb_vector
-    PUBLIC
-        usearch
-)
 
 add_executable(raftvdb-node
     cmd/node/main.cpp
@@ -124,7 +115,6 @@ target_link_libraries(raftvdb-node
         raftvdb_storage
         raftvdb_vector
         raftvdb_proto
-        usearch
         Boost::system
         spdlog::spdlog
         tomlplusplus::tomlplusplus
@@ -140,7 +130,6 @@ target_link_libraries(raftvdb-bench
         raftvdb_storage
         raftvdb_vector
         raftvdb_proto
-        usearch
         Boost::system
         spdlog::spdlog
         tomlplusplus::tomlplusplus

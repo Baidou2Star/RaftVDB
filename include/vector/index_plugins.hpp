@@ -8,7 +8,7 @@
 #include <cstring> // `std::strncmp`
 #include <thread>  // `std::thread`
 
-#include <usearch/index.hpp> // `expected_gt` and macros
+#include "index.hpp" // `expected_gt` and macros
 
 #if !defined(USEARCH_USE_OPENMP)
 #define USEARCH_USE_OPENMP 0

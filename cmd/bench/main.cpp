@@ -1,7 +1,7 @@
 #include <iostream>
 #include <typeinfo>
 
-#include <usearch/index_dense.hpp>
+#include <vector/index_dense.hpp>
 
 #include "raft.grpc.pb.h"
 

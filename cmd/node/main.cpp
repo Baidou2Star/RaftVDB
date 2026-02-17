@@ -1,6 +1,6 @@
 #include <iostream>
 
-#include <usearch/index_dense.hpp>
+#include <vector/index_dense.hpp>
 
 #include "raft.pb.h"
 
