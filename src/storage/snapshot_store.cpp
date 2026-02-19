@@ -308,6 +308,44 @@ Result<void> SnapshotStore::Initialize() const {
     return CleanupTemporaryFiles();
 }
 
+Result<void> SnapshotStore::FinalizeSnapshot(const SnapshotMeta& meta) const {
+    const std::filesystem::path temp_snapshot_path = TemporarySnapshotPath();
+    const std::filesystem::path final_snapshot_path = SnapshotPath();
+    const std::filesystem::path temp_meta_path = TemporaryMetaPath();
+    const std::filesystem::path final_meta_path = MetaPath();
+
+    if (!std::filesystem::exists(temp_snapshot_path)) {
+        return Result<void>::Err("提交快照失败: snapshot.tmp 不存在");
+    }
+
+    auto save_meta = meta.SaveToFile(temp_meta_path.string());
+    if (!save_meta) {
+        std::error_code cleanup_ec;
+        std::filesystem::remove(temp_meta_path, cleanup_ec);
+        return save_meta;
+    }
+
+    std::error_code snapshot_rename_ec;
+    std::filesystem::rename(temp_snapshot_path, final_snapshot_path, snapshot_rename_ec);
+    if (snapshot_rename_ec) {
+        std::error_code cleanup_snapshot_ec;
+        std::error_code cleanup_meta_ec;
+        std::filesystem::remove(temp_snapshot_path, cleanup_snapshot_ec);
+        std::filesystem::remove(temp_meta_path, cleanup_meta_ec);
+        return Result<void>::Err("原子替换正式快照失败: " + snapshot_rename_ec.message());
+    }
+
+    std::error_code meta_rename_ec;
+    std::filesystem::rename(temp_meta_path, final_meta_path, meta_rename_ec);
+    if (meta_rename_ec) {
+        std::error_code cleanup_meta_ec;
+        std::filesystem::remove(temp_meta_path, cleanup_meta_ec);
+        return Result<void>::Err("原子替换快照元数据失败: " + meta_rename_ec.message());
+    }
+
+    return Result<void>::Ok();
+}
+
 Result<void> SnapshotStore::CleanupTemporaryFiles() const {
     try {
         for (const auto& entry : std::filesystem::directory_iterator(snapshot_dir_)) {
@@ -357,4 +395,8 @@ std::string SnapshotStore::MetaPath() const {
 
 std::string SnapshotStore::TemporarySnapshotPath() const {
     return (std::filesystem::path(snapshot_dir_) / "snapshot.tmp").string();
+}
+
+std::string SnapshotStore::TemporaryMetaPath() const {
+    return (std::filesystem::path(snapshot_dir_) / "snapshot.meta.tmp").string();
 }

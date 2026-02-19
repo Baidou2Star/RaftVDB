@@ -24,6 +24,7 @@ public:
     explicit SnapshotStore(std::string snapshot_dir);
 
     Result<void> Initialize() const;
+    Result<void> FinalizeSnapshot(const SnapshotMeta& meta) const;
     bool HasSnapshot() const;
     Result<SnapshotMeta> LoadLatest(const VectorConfig& config) const;
 
@@ -33,6 +34,7 @@ public:
 
 private:
     Result<void> CleanupTemporaryFiles() const;
+    std::string TemporaryMetaPath() const;
 
     std::string snapshot_dir_;
 };

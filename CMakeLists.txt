@@ -203,4 +203,14 @@ if(BUILD_TESTING)
             raftvdb_vector
     )
     add_test(NAME raftvdb-test-vector-index COMMAND raftvdb-test-vector-index)
+
+    add_executable(raftvdb-test-vector-snapshot
+        tests/unit/test_vector_snapshot.cpp
+    )
+    target_link_libraries(raftvdb-test-vector-snapshot
+        PRIVATE
+            raftvdb_storage
+            raftvdb_vector
+    )
+    add_test(NAME raftvdb-test-vector-snapshot COMMAND raftvdb-test-vector-snapshot)
 endif()

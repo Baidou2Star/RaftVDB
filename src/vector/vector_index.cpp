@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -26,6 +27,22 @@ std::string FormatUsearchError(std::string_view prefix, const unum::usearch::err
 size_t DetectThreadCount() {
     const unsigned int hardware_threads = std::thread::hardware_concurrency();
     return hardware_threads == 0U ? 1U : static_cast<size_t>(hardware_threads);
+}
+
+Result<void> EnsureParentDirectory(const std::string& path) {
+    const std::filesystem::path file_path(path);
+    const auto parent = file_path.parent_path();
+    if (parent.empty()) {
+        return Result<void>::Ok();
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(parent, ec);
+    if (ec) {
+        return Result<void>::Err("创建快照目录失败: " + ec.message());
+    }
+
+    return Result<void>::Ok();
 }
 
 } // namespace
@@ -76,6 +93,65 @@ Result<std::shared_ptr<VectorIndex>> VectorIndex::Create(const VectorConfig& cfg
 
     return Result<std::shared_ptr<VectorIndex>>::Ok(
         std::shared_ptr<VectorIndex>(new VectorIndex(std::move(state.index), std::move(normalized))));
+}
+
+Result<std::shared_ptr<VectorIndex>> VectorIndex::LoadFromSnapshot(const std::string& snapshot_path,
+                                                                   const VectorConfig& cfg) {
+    auto validate = ValidateCreateConfig(cfg);
+    if (!validate) {
+        return Result<std::shared_ptr<VectorIndex>>::Err(validate.error);
+    }
+
+    VectorConfig normalized = cfg;
+    normalized.metric = ToLower(normalized.metric);
+    normalized.data_type = ToLower(normalized.data_type);
+
+    auto metric_kind = ParseMetric(normalized.metric);
+    if (!metric_kind) {
+        return Result<std::shared_ptr<VectorIndex>>::Err(metric_kind.error);
+    }
+
+    auto scalar_kind = ParseScalarKind(normalized.data_type);
+    if (!scalar_kind) {
+        return Result<std::shared_ptr<VectorIndex>>::Err(scalar_kind.error);
+    }
+
+    auto metadata = unum::usearch::index_dense_metadata_from_path(snapshot_path.c_str());
+    if (!metadata) {
+        return Result<std::shared_ptr<VectorIndex>>::Err(
+            FormatUsearchError("读取快照头信息失败: ", metadata.error));
+    }
+    if (metadata.head.dimensions != normalized.dim) {
+        return Result<std::shared_ptr<VectorIndex>>::Err("快照维度与当前配置不一致");
+    }
+    if (metadata.head.kind_metric != *metric_kind) {
+        return Result<std::shared_ptr<VectorIndex>>::Err("快照 metric 与当前配置不一致");
+    }
+    if (metadata.head.kind_scalar != *scalar_kind) {
+        return Result<std::shared_ptr<VectorIndex>>::Err("快照 data_type 与当前配置不一致");
+    }
+
+    auto state = unum::usearch::index_dense_t::make(snapshot_path.c_str(), false);
+    if (!state) {
+        return Result<std::shared_ptr<VectorIndex>>::Err(
+            FormatUsearchError("加载 USearch 快照失败: ", state.error));
+    }
+
+    state.index.change_expansion_add(normalized.expansion_add);
+    state.index.change_expansion_search(normalized.expansion_search);
+
+    const size_t total_slots = static_cast<size_t>(metadata.head.count_present) +
+                               static_cast<size_t>(metadata.head.count_deleted);
+    const size_t reserve_members = std::max<size_t>(normalized.initial_capacity, total_slots);
+    if (!state.index.try_reserve(
+            unum::usearch::index_limits_t(reserve_members, DetectThreadCount()))) {
+        return Result<std::shared_ptr<VectorIndex>>::Err("为快照索引预留运行时容量失败");
+    }
+
+    auto loaded =
+        std::shared_ptr<VectorIndex>(new VectorIndex(std::move(state.index), std::move(normalized)));
+    loaded->deleted_count_.store(static_cast<size_t>(metadata.head.count_deleted));
+    return Result<std::shared_ptr<VectorIndex>>::Ok(std::move(loaded));
 }
 
 Result<void> VectorIndex::Upsert(uint64_t id, const float* vec, size_t dim) {
@@ -154,6 +230,43 @@ Result<std::vector<VectorIndex::SearchResult>> VectorIndex::Search(const float* 
     }
 
     return Result<std::vector<SearchResult>>::Ok(std::move(results));
+}
+
+Result<void> VectorIndex::SaveSnapshot(const std::string& tmp_path) const {
+    auto ensure_dir = EnsureParentDirectory(tmp_path);
+    if (!ensure_dir) {
+        return ensure_dir;
+    }
+
+    auto clone = CloneUnderLock();
+    if (!clone) {
+        return Result<void>::Err(clone.error);
+    }
+
+    std::error_code remove_ec;
+    std::filesystem::remove(tmp_path, remove_ec);
+
+    auto saved = (*clone)->save(tmp_path.c_str());
+    if (!saved) {
+        std::error_code cleanup_ec;
+        std::filesystem::remove(tmp_path, cleanup_ec);
+        return Result<void>::Err(FormatUsearchError("保存 USearch 快照失败: ", saved.error));
+    }
+
+    return Result<void>::Ok();
+}
+
+Result<std::unique_ptr<unum::usearch::index_dense_t>> VectorIndex::CloneUnderLock() const {
+    std::unique_lock lock(mutex_);
+
+    auto cloned = index_.copy();
+    if (!cloned) {
+        return Result<std::unique_ptr<unum::usearch::index_dense_t>>::Err(
+            FormatUsearchError("克隆 USearch 索引失败: ", cloned.error));
+    }
+
+    return Result<std::unique_ptr<unum::usearch::index_dense_t>>::Ok(
+        std::make_unique<unum::usearch::index_dense_t>(std::move(cloned.index)));
 }
 
 Result<void> VectorIndex::Compact() {

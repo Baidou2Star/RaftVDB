@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <shared_mutex>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -21,10 +22,14 @@ public:
     };
 
     static Result<std::shared_ptr<VectorIndex>> Create(const VectorConfig& cfg);
+    static Result<std::shared_ptr<VectorIndex>> LoadFromSnapshot(const std::string& snapshot_path,
+                                                                const VectorConfig& cfg);
 
     Result<void> Upsert(uint64_t id, const float* vec, size_t dim);
     Result<void> Delete(uint64_t id);
     Result<std::vector<SearchResult>> Search(const float* vec, size_t dim, size_t top_k) const;
+    Result<void> SaveSnapshot(const std::string& tmp_path) const;
+    Result<std::unique_ptr<unum::usearch::index_dense_t>> CloneUnderLock() const;
 
     Result<void> Compact();
     Result<void> Isolate();
