@@ -103,6 +103,7 @@ target_link_libraries(raftvdb_storage
 
 add_library(raftvdb_vector STATIC
     src/vector/vector_index.cpp
+    src/vector/index_maintenance.cpp
 )
 
 add_executable(raftvdb-node
@@ -213,4 +214,13 @@ if(BUILD_TESTING)
             raftvdb_vector
     )
     add_test(NAME raftvdb-test-vector-snapshot COMMAND raftvdb-test-vector-snapshot)
+
+    add_executable(raftvdb-test-index-maintenance
+        tests/unit/test_index_maintenance.cpp
+    )
+    target_link_libraries(raftvdb-test-index-maintenance
+        PRIVATE
+            raftvdb_vector
+    )
+    add_test(NAME raftvdb-test-index-maintenance COMMAND raftvdb-test-index-maintenance)
 endif()
