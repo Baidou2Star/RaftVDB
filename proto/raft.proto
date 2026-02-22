@@ -2,34 +2,205 @@ syntax = "proto3";
 
 package raftvdb.proto;
 
-// T-05 starts introducing the protobuf messages that are already needed by the
-// in-process data model. The remaining Raft RPC surface will be expanded in T-12.
+// 生成 C++ 代码时开启 arena，降低高频 RPC 场景下的消息分配开销。
+option cc_enable_arenas = true;
+
+// ─────────────────────────────────────────────────────────────
+// 状态机命令与持久化基础消息
+// ─────────────────────────────────────────────────────────────
+
+// 向量写入命令。
+// 由客户端请求最终转换成 LogEntry.payload 持久化到 WAL 中。
 message UpsertCmd {
+  // 被写入或覆盖的向量主键。
   uint64 id = 1;
+
+  // 向量原始数据，维度由配置文件中的 vector.dim 决定。
   repeated float vector = 2;
+
+  // 客户端去重请求 ID，用于后续幂等处理。
   string request_id = 3;
 }
 
+// 向量删除命令。
 message DeleteCmd {
+  // 被删除的向量主键。
   uint64 id = 1;
+
+  // 客户端去重请求 ID，用于后续幂等处理。
   string request_id = 2;
 }
 
+// Raft 日志项。
+// 这里保留为较薄的一层封装，payload 内部再嵌套具体命令。
 message LogEntry {
+  // 日志索引，从 1 开始单调递增。
   uint64 index = 1;
+
+  // 产生该日志项的任期号。
   uint64 term = 2;
+
+  // 日志项类型，对应本地 EntryType 枚举。
   uint32 type = 3;
+
+  // 命令类型，对应本地 CmdType 枚举。
   uint32 cmd_type = 4;
+
+  // 已序列化的 UpsertCmd / DeleteCmd / 未来扩展命令。
   bytes payload = 5;
 }
 
+// 持久化保存 currentTerm 和 votedFor 的元数据记录。
 message RaftMetaRecord {
   uint64 current_term = 1;
   string voted_for = 2;
 }
 
+// 空消息，主要用于 GetLeader 等无需请求体的 RPC。
 message Empty {}
 
-service BootstrapService {
-  rpc Ping(Empty) returns (Empty);
+// ─────────────────────────────────────────────────────────────
+// 拓扑与链式复制辅助消息
+// ─────────────────────────────────────────────────────────────
+
+// 通过心跳和日志复制传播的拓扑信息。
+message TopologyInfo {
+  // 当前节点在拓扑中的角色："leader" | "mentor" | "follower"。
+  string role = 1;
+
+  // 若当前节点是 follower，则表示其上游 mentor/leader 节点 ID。
+  string source_node_id = 2;
+}
+
+// 客户端探测当前 Leader 时返回的简要信息。
+message LeaderInfo {
+  // 当前 Leader 节点 ID。
+  string leader_id = 1;
+
+  // 当前 Leader 对外可访问地址。
+  string leader_addr = 2;
+
+  // Leader 所处任期。
+  uint64 term = 3;
+}
+
+// ─────────────────────────────────────────────────────────────
+// AppendEntries
+// ─────────────────────────────────────────────────────────────
+
+// 日志复制请求，同时承载批量日志和拓扑同步信息。
+message AppendEntriesRequest {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+
+  // 批量日志项，用于 Batch + Pipeline 发送。
+  repeated LogEntry entries = 5;
+
+  uint64 leader_commit = 6;
+
+  // Leader 当前视角下的拓扑信息，用于跟随节点更新本地链路来源。
+  TopologyInfo topology = 7;
+}
+
+// 日志复制响应。
+message AppendEntriesResponse {
+  uint64 term = 1;
+  bool success = 2;
+
+  // 复制成功时，接收方当前匹配到的最后日志索引。
+  uint64 match_index = 3;
+
+  // 复制失败时的冲突索引提示。
+  uint64 conflict_index = 4;
+
+  // 复制失败时的冲突任期提示。
+  uint64 conflict_term = 5;
+
+  // 返回响应的节点 ID，用于 Leader 区分 Mentor / Follower 的 ACK 来源。
+  string node_id = 6;
+}
+
+// ─────────────────────────────────────────────────────────────
+// RequestVote
+// ─────────────────────────────────────────────────────────────
+
+message RequestVoteRequest {
+  uint64 term = 1;
+  string candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message RequestVoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Heartbeat
+// ─────────────────────────────────────────────────────────────
+
+// 心跳请求，负责保活、提交索引推进和拓扑广播。
+message HeartbeatRequest {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 commit_index = 3;
+  TopologyInfo topology = 4;
+}
+
+message HeartbeatResponse {
+  uint64 term = 1;
+  bool success = 2;
+  string node_id = 3;
+}
+
+// ─────────────────────────────────────────────────────────────
+// InstallSnapshot
+// ─────────────────────────────────────────────────────────────
+
+// 快照流式传输中的单个分片。
+message SnapshotChunk {
+  // 当前 chunk 的原始字节数据。
+  bytes data = 1;
+
+  // 当前 chunk 在整份快照文件中的字节偏移。
+  uint64 offset = 2;
+
+  // 标记是否为最后一个 chunk。
+  bool is_last = 3;
+
+  // 以下字段用于在接收端重建快照元数据。
+  uint64 raft_term = 4;
+  uint64 raft_index = 5;
+  uint32 dim = 6;
+  string metric = 7;
+  string data_type = 8;
+}
+
+message InstallSnapshotResponse {
+  uint64 term = 1;
+  bool success = 2;
+}
+
+// ─────────────────────────────────────────────────────────────
+// RaftService 定义
+// ─────────────────────────────────────────────────────────────
+
+service RaftService {
+  // 复制日志项；也用于空 entries 的追加确认。
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+
+  // 发起选举时请求投票。
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+
+  // 周期性心跳与拓扑广播。
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // 以客户端流方式发送快照文件。
+  rpc InstallSnapshot(stream SnapshotChunk) returns (InstallSnapshotResponse);
+
+  // 供客户端或工具探测当前 Leader。
+  rpc GetLeader(Empty) returns (LeaderInfo);
 }

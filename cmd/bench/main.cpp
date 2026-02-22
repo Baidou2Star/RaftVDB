@@ -6,13 +6,14 @@
 #include "raft.grpc.pb.h"
 
 int main() {
-    // The bench stub stays intentionally small in T-01, but it still validates
-    // that the generated gRPC header and USearch headers are available.
-    using BootstrapService = raftvdb::proto::BootstrapService;
+    // bench 入口暂时只做最小验证：
+    // 1. gRPC 生成的 Service/Stub 类型可见
+    // 2. vendoring 的 USearch 头文件可见
+    using RaftService = raftvdb::proto::RaftService;
     using DenseIndex = unum::usearch::index_dense_t;
 
     std::cout << "RaftVDB bench bootstrap ready. "
-              << "service_tag=" << typeid(BootstrapService).name() << ", "
+              << "service_tag=" << typeid(RaftService).name() << ", "
               << "dense_index_size=" << sizeof(DenseIndex) << '\n';
     return 0;
 }

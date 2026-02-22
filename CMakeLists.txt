@@ -223,4 +223,13 @@ if(BUILD_TESTING)
             raftvdb_vector
     )
     add_test(NAME raftvdb-test-index-maintenance COMMAND raftvdb-test-index-maintenance)
+
+    add_executable(raftvdb-test-proto-smoke
+        tests/unit/test_proto_smoke.cpp
+    )
+    target_link_libraries(raftvdb-test-proto-smoke
+        PRIVATE
+            raftvdb_proto
+    )
+    add_test(NAME raftvdb-test-proto-smoke COMMAND raftvdb-test-proto-smoke)
 endif()
