@@ -84,6 +84,7 @@ target_link_libraries(raftvdb_common
 add_library(raftvdb_raft STATIC
     src/raft/log_entry.cpp
     src/raft/raft_client.cpp
+    src/raft/raft_server.cpp
 )
 target_link_libraries(raftvdb_raft
     PUBLIC
@@ -243,4 +244,13 @@ if(BUILD_TESTING)
             raftvdb_raft
     )
     add_test(NAME raftvdb-test-raft-client COMMAND raftvdb-test-raft-client)
+
+    add_executable(raftvdb-test-raft-server
+        tests/unit/test_raft_server.cpp
+    )
+    target_link_libraries(raftvdb-test-raft-server
+        PRIVATE
+            raftvdb_raft
+    )
+    add_test(NAME raftvdb-test-raft-server COMMAND raftvdb-test-raft-server)
 endif()
