@@ -85,6 +85,7 @@ add_library(raftvdb_raft STATIC
     src/raft/log_entry.cpp
     src/raft/raft_client.cpp
     src/raft/raft_server.cpp
+    src/raft/topology.cpp
 )
 target_link_libraries(raftvdb_raft
     PUBLIC
@@ -253,4 +254,13 @@ if(BUILD_TESTING)
             raftvdb_raft
     )
     add_test(NAME raftvdb-test-raft-server COMMAND raftvdb-test-raft-server)
+
+    add_executable(raftvdb-test-topology
+        tests/unit/test_topology.cpp
+    )
+    target_link_libraries(raftvdb-test-topology
+        PRIVATE
+            raftvdb_raft
+    )
+    add_test(NAME raftvdb-test-topology COMMAND raftvdb-test-topology)
 endif()
