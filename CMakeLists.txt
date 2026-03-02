@@ -87,6 +87,7 @@ add_library(raftvdb_raft STATIC
     src/raft/raft_server.cpp
     src/raft/topology.cpp
     src/raft/lease.cpp
+    src/client/dedup.cpp
 )
 target_link_libraries(raftvdb_raft
     PUBLIC
@@ -273,4 +274,13 @@ if(BUILD_TESTING)
             raftvdb_raft
     )
     add_test(NAME raftvdb-test-lease COMMAND raftvdb-test-lease)
+
+    add_executable(raftvdb-test-dedup
+        tests/unit/test_dedup.cpp
+    )
+    target_link_libraries(raftvdb-test-dedup
+        PRIVATE
+            raftvdb_raft
+    )
+    add_test(NAME raftvdb-test-dedup COMMAND raftvdb-test-dedup)
 endif()

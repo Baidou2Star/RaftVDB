@@ -56,6 +56,27 @@ message RaftMetaRecord {
   string voted_for = 2;
 }
 
+// DedupTable 中的单条已提交记录。
+// pending 状态不会跟随快照持久化，因此这里不保存 committed 字段。
+message DedupRecord {
+  // 客户端请求唯一 ID。
+  string request_id = 1;
+
+  // 该请求最终对应的日志索引，用于滑动窗口按最旧记录淘汰。
+  uint64 log_index = 2;
+
+  // Apply 完成后的执行结果。
+  bool success = 3;
+
+  // 执行失败时的错误信息；成功时通常为空字符串。
+  string error = 4;
+}
+
+// DedupTable 快照。随 snapshot.usearch 一起持久化为 dedup.bin。
+message DedupSnapshot {
+  repeated DedupRecord records = 1;
+}
+
 // 空消息，主要用于 GetLeader 等无需请求体的 RPC。
 message Empty {}
 
