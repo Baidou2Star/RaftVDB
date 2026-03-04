@@ -81,15 +81,10 @@ target_link_libraries(raftvdb_common
         tomlplusplus::tomlplusplus
 )
 
-add_library(raftvdb_raft STATIC
+add_library(raftvdb_raft_log STATIC
     src/raft/log_entry.cpp
-    src/raft/raft_client.cpp
-    src/raft/raft_server.cpp
-    src/raft/topology.cpp
-    src/raft/lease.cpp
-    src/client/dedup.cpp
 )
-target_link_libraries(raftvdb_raft
+target_link_libraries(raftvdb_raft_log
     PUBLIC
         raftvdb_common
         raftvdb_proto
@@ -103,13 +98,29 @@ add_library(raftvdb_storage STATIC
 target_link_libraries(raftvdb_storage
     PUBLIC
         raftvdb_common
-        raftvdb_raft
+        raftvdb_raft_log
         raftvdb_proto
 )
 
 add_library(raftvdb_vector STATIC
     src/vector/vector_index.cpp
     src/vector/index_maintenance.cpp
+)
+
+add_library(raftvdb_raft STATIC
+    src/raft/raft_client.cpp
+    src/raft/raft_server.cpp
+    src/raft/raft_node.cpp
+    src/raft/topology.cpp
+    src/raft/lease.cpp
+    src/client/dedup.cpp
+)
+target_link_libraries(raftvdb_raft
+    PUBLIC
+        raftvdb_common
+        raftvdb_proto
+        raftvdb_raft_log
+        raftvdb_storage
 )
 
 add_executable(raftvdb-node
@@ -171,7 +182,7 @@ if(BUILD_TESTING)
     )
     target_link_libraries(raftvdb-test-log-entry
         PRIVATE
-            raftvdb_raft
+            raftvdb_raft_log
     )
     add_test(NAME raftvdb-test-log-entry COMMAND raftvdb-test-log-entry)
 
@@ -283,4 +294,13 @@ if(BUILD_TESTING)
             raftvdb_raft
     )
     add_test(NAME raftvdb-test-dedup COMMAND raftvdb-test-dedup)
+
+    add_executable(raftvdb-test-raft-node
+        tests/unit/test_raft_node.cpp
+    )
+    target_link_libraries(raftvdb-test-raft-node
+        PRIVATE
+            raftvdb_raft
+    )
+    add_test(NAME raftvdb-test-raft-node COMMAND raftvdb-test-raft-node)
 endif()
