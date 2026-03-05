@@ -91,6 +91,12 @@ message TopologyInfo {
 
   // 若当前节点是 follower，则表示其上游 mentor/leader 节点 ID。
   string source_node_id = 2;
+
+  // 仅对 mentor 有意义：
+  // Leader 在广播给 Mentor 时，会把该 Mentor 当前负责的下游 Follower 节点 ID
+  // 一并带上，便于 Mentor 在本地执行 T-23 的转发逻辑。
+  // Leader / Follower 收到时该字段通常为空。
+  string follower_node_id = 3;
 }
 
 // 客户端探测当前 Leader 时返回的简要信息。

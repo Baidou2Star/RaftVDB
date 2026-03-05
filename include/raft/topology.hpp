@@ -63,6 +63,7 @@ public:
     // 查询接口。
     std::vector<NodeInfo> GetMentors() const;
     std::optional<NodeInfo> GetFollowerOf(const std::string& mentor_id) const;
+    std::optional<NodeInfo> GetMentorOf(const std::string& follower_id) const;
     std::optional<NodeInfo> GetNode(const std::string& node_id) const;
     std::vector<NodeInfo> AllNodes() const;
 

@@ -121,6 +121,7 @@ target_link_libraries(raftvdb_raft
         raftvdb_proto
         raftvdb_raft_log
         raftvdb_storage
+        raftvdb_vector
 )
 
 add_executable(raftvdb-node
@@ -303,4 +304,13 @@ if(BUILD_TESTING)
             raftvdb_raft
     )
     add_test(NAME raftvdb-test-raft-node COMMAND raftvdb-test-raft-node)
+
+    add_executable(raftvdb-test-raft-runtime
+        tests/unit/test_raft_runtime.cpp
+    )
+    target_link_libraries(raftvdb-test-raft-runtime
+        PRIVATE
+            raftvdb_raft
+    )
+    add_test(NAME raftvdb-test-raft-runtime COMMAND raftvdb-test-raft-runtime)
 endif()

@@ -232,6 +232,15 @@ Result<void> WAL::OpenActiveSegmentForAppend() {
         return Result<void>::Err(open_result.error);
     }
     fd_ = *open_result;
+
+    // 重新打开已有活动段时，必须把写指针显式移动到当前段尾。
+    // 否则在恢复、截断或重启后继续追加时，新的 WAL 记录会从文件头覆盖旧数据。
+    if (::lseek(fd_, static_cast<off_t>(segments_.back().size_bytes), SEEK_SET) < 0) {
+        auto error = std::string(std::strerror(errno));
+        auto ignored = CloseFile(&fd_);
+        (void)ignored;
+        return Result<void>::Err("定位 WAL 活动段写指针失败: " + error);
+    }
     return Result<void>::Ok();
 }
 
@@ -429,8 +438,12 @@ Result<LogEntry> WAL::Read(uint64_t index) {
 }
 
 Result<std::vector<LogEntry>> WAL::ReadFrom(uint64_t from_index) {
+    return ReadFrom(from_index, std::numeric_limits<size_t>::max());
+}
+
+Result<std::vector<LogEntry>> WAL::ReadFrom(uint64_t from_index, size_t max_entries) {
     std::vector<LogEntry> entries;
-    if (offset_index_.empty() || from_index > last_index_) {
+    if (max_entries == 0 || offset_index_.empty() || from_index > last_index_) {
         return Result<std::vector<LogEntry>>::Ok(std::move(entries));
     }
 
@@ -440,6 +453,9 @@ Result<std::vector<LogEntry>> WAL::ReadFrom(uint64_t from_index) {
     }
 
     for (auto it = begin; it != offset_index_.end(); ++it) {
+        if (entries.size() >= max_entries) {
+            break;
+        }
         auto entry = ReadRecordAt(it->second);
         if (!entry) {
             return Result<std::vector<LogEntry>>::Err(entry.error);
@@ -448,6 +464,18 @@ Result<std::vector<LogEntry>> WAL::ReadFrom(uint64_t from_index) {
     }
 
     return Result<std::vector<LogEntry>>::Ok(std::move(entries));
+}
+
+Result<uint64_t> WAL::TermAt(uint64_t index) {
+    if (index == 0) {
+        return Result<uint64_t>::Ok(0);
+    }
+
+    auto entry = Read(index);
+    if (!entry) {
+        return Result<uint64_t>::Err(entry.error);
+    }
+    return Result<uint64_t>::Ok(entry->term);
 }
 
 Result<void> WAL::RemoveSegmentEntries(const SegmentMeta& segment) {
@@ -645,6 +673,109 @@ Result<void> WAL::TruncateBefore(uint64_t index) {
         }
     }
 
+    return Result<void>::Ok();
+}
+
+Result<void> WAL::TruncateSuffix(uint64_t index) {
+    if (index == 0) {
+        return Result<void>::Err("TruncateSuffix 失败: index 必须从 1 开始");
+    }
+    if (offset_index_.empty() || index > last_index_) {
+        return Result<void>::Ok();
+    }
+
+    auto close_result = CloseFile(&fd_);
+    if (!close_result) {
+        return close_result;
+    }
+
+    auto remove_it = offset_index_.lower_bound(index);
+    if (remove_it == offset_index_.end()) {
+        auto reopen = OpenActiveSegmentForAppend();
+        if (!reopen) {
+            return reopen;
+        }
+        return Result<void>::Ok();
+    }
+
+    const auto truncate_location = remove_it->second;
+    bool truncated_partial_segment = false;
+    std::filesystem::path partial_segment_path;
+
+    for (auto it = segments_.begin(); it != segments_.end();) {
+        if (it->start_index >= index) {
+            std::error_code ec;
+            std::filesystem::remove(it->path, ec);
+            if (ec) {
+                return Result<void>::Err("删除 WAL 尾部段失败: " + ec.message());
+            }
+            it = segments_.erase(it);
+            continue;
+        }
+
+        if (it->last_index >= index) {
+            auto open_result = OpenFile(it->path, O_RDWR);
+            if (!open_result) {
+                return Result<void>::Err(open_result.error);
+            }
+            int fd = *open_result;
+            auto truncate_result = TruncateFile(fd, truncate_location.offset);
+            auto close_segment = CloseFile(&fd);
+            if (!truncate_result) {
+                (void)close_segment;
+                return truncate_result;
+            }
+            if (!close_segment) {
+                return close_segment;
+            }
+
+            it->size_bytes = truncate_location.offset;
+            it->last_index = index > it->start_index ? index - 1 : 0;
+            truncated_partial_segment = true;
+            partial_segment_path = it->path;
+
+            ++it;
+            while (it != segments_.end()) {
+                std::error_code ec;
+                std::filesystem::remove(it->path, ec);
+                if (ec) {
+                    return Result<void>::Err("删除 WAL 尾部段失败: " + ec.message());
+                }
+                it = segments_.erase(it);
+            }
+            break;
+        }
+
+        ++it;
+    }
+
+    for (auto it = offset_index_.begin(); it != offset_index_.end();) {
+        if (it->first >= index) {
+            it = offset_index_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    if (segments_.empty()) {
+        auto create_result = CreateFreshSegment(index);
+        if (!create_result) {
+            return create_result;
+        }
+    } else if (truncated_partial_segment && segments_.back().path != partial_segment_path) {
+        auto remove_result = RemoveSegmentsAfter(segments_.size() - 1);
+        if (!remove_result) {
+            return remove_result;
+        }
+    }
+
+    start_ = segments_.front().start_index;
+    last_index_ = offset_index_.empty() ? index - 1 : offset_index_.rbegin()->first;
+
+    auto reopen_result = OpenActiveSegmentForAppend();
+    if (!reopen_result) {
+        return reopen_result;
+    }
     return Result<void>::Ok();
 }
 

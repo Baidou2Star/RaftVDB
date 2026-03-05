@@ -23,7 +23,10 @@ public:
     Result<void> Flush();                              // fdatasync
     Result<LogEntry> Read(uint64_t index);
     Result<std::vector<LogEntry>> ReadFrom(uint64_t from_index);
+    Result<std::vector<LogEntry>> ReadFrom(uint64_t from_index, size_t max_entries);
+    Result<uint64_t> TermAt(uint64_t index);
     Result<void> TruncateBefore(uint64_t index);      // 快照后截断整段旧日志
+    Result<void> TruncateSuffix(uint64_t index);      // 冲突覆盖时裁掉 index 及之后的尾部日志
     uint64_t LastIndex() const noexcept { return last_index_; }
     Result<void> Close();
 

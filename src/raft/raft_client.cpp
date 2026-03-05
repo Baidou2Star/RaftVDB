@@ -52,6 +52,26 @@ RaftClient::~RaftClient() {
     state_->shutting_down.store(true);
 }
 
+Result<raftvdb::proto::AppendEntriesResponse> RaftClient::AppendEntries(
+    const std::string& peer_addr,
+    const raftvdb::proto::AppendEntriesRequest& request) const {
+    auto validate = ValidatePeerAddress(peer_addr);
+    if (!validate) {
+        return Result<raftvdb::proto::AppendEntriesResponse>::Err(validate.error);
+    }
+
+    auto stub_result = GetOrCreateStub(peer_addr);
+    if (!stub_result) {
+        return Result<raftvdb::proto::AppendEntriesResponse>::Err(stub_result.error);
+    }
+
+    grpc::ClientContext context;
+    ApplyDeadline(context, state_->options.append_entries_timeout);
+    raftvdb::proto::AppendEntriesResponse response;
+    grpc::Status status = (*stub_result)->AppendEntries(&context, request, &response);
+    return FinishUnaryRpc(std::move(status), std::move(response), "AppendEntries");
+}
+
 Result<void> RaftClient::AppendEntriesAsync(
     const std::string& peer_addr,
     const raftvdb::proto::AppendEntriesRequest& request,
@@ -139,6 +159,26 @@ Result<void> RaftClient::HeartbeatAsync(const std::string& peer_addr,
     }
 
     return Result<void>::Ok();
+}
+
+Result<raftvdb::proto::HeartbeatResponse> RaftClient::Heartbeat(
+    const std::string& peer_addr,
+    const raftvdb::proto::HeartbeatRequest& request) const {
+    auto validate = ValidatePeerAddress(peer_addr);
+    if (!validate) {
+        return Result<raftvdb::proto::HeartbeatResponse>::Err(validate.error);
+    }
+
+    auto stub_result = GetOrCreateStub(peer_addr);
+    if (!stub_result) {
+        return Result<raftvdb::proto::HeartbeatResponse>::Err(stub_result.error);
+    }
+
+    grpc::ClientContext context;
+    ApplyDeadline(context, state_->options.heartbeat_timeout);
+    raftvdb::proto::HeartbeatResponse response;
+    grpc::Status status = (*stub_result)->Heartbeat(&context, request, &response);
+    return FinishUnaryRpc(std::move(status), std::move(response), "Heartbeat");
 }
 
 Result<raftvdb::proto::InstallSnapshotResponse> RaftClient::InstallSnapshot(

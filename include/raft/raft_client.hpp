@@ -46,6 +46,10 @@ public:
     explicit RaftClient(RaftClientOptions options = {});
     ~RaftClient();
 
+    Result<raftvdb::proto::AppendEntriesResponse> AppendEntries(
+        const std::string& peer_addr,
+        const raftvdb::proto::AppendEntriesRequest& request) const;
+
     Result<void> AppendEntriesAsync(const std::string& peer_addr,
                                     const raftvdb::proto::AppendEntriesRequest& request,
                                     AppendEntriesCallback callback) const;
@@ -57,6 +61,10 @@ public:
     Result<void> HeartbeatAsync(const std::string& peer_addr,
                                 const raftvdb::proto::HeartbeatRequest& request,
                                 HeartbeatCallback callback) const;
+
+    Result<raftvdb::proto::HeartbeatResponse> Heartbeat(
+        const std::string& peer_addr,
+        const raftvdb::proto::HeartbeatRequest& request) const;
 
     Result<raftvdb::proto::InstallSnapshotResponse> InstallSnapshot(
         const std::string& peer_addr,

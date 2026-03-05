@@ -304,6 +304,12 @@ Result<raftvdb::proto::TopologyInfo> TopologyManager::ToProto(const std::string&
     raftvdb::proto::TopologyInfo proto;
     proto.set_role(RoleToString(found->second.role));
     proto.set_source_node_id(found->second.source_node_id);
+    if (IsMentorRole(found->second.role)) {
+        auto follower_id = FindFollowerIdOfLocked(node_id);
+        if (follower_id) {
+            proto.set_follower_node_id(*follower_id);
+        }
+    }
     return Result<raftvdb::proto::TopologyInfo>::Ok(std::move(proto));
 }
 
@@ -355,8 +361,33 @@ Result<void> TopologyManager::FromProto(const std::string& node_id,
         }
     }
 
+    // 仅 Mentor 需要恢复自己的下游 Follower 绑定关系。
+    // 这里不广播完整拓扑，只把“我当前负责谁”这条信息带下来即可。
+    if (IsMentorRole(node.role) && !proto.follower_node_id().empty()) {
+        NodeInfo& follower = EnsureNodeLocked(proto.follower_node_id());
+        follower.addr = ResolveAddressLocked(follower.node_id);
+        follower.role = NodeRole::kFollower;
+        follower.source_node_id = node_id;
+        follower.healthy = true;
+    }
+
     NormalizeMentorSourcesLocked();
     return Result<void>::Ok();
+}
+
+std::optional<NodeInfo> TopologyManager::GetMentorOf(const std::string& follower_id) const {
+    std::shared_lock lock(mutex_);
+    auto found = nodes_.find(follower_id);
+    if (found == nodes_.end() || !IsFollowerRole(found->second.role) ||
+        found->second.source_node_id.empty()) {
+        return std::nullopt;
+    }
+
+    auto mentor = nodes_.find(found->second.source_node_id);
+    if (mentor == nodes_.end()) {
+        return std::nullopt;
+    }
+    return mentor->second;
 }
 
 std::string TopologyManager::RoleToString(NodeRole role) {

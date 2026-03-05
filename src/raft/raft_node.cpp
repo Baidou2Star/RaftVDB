@@ -1,13 +1,48 @@
 #include "raft/raft_node.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
+#include <random>
 #include <utility>
+
+#include "common/logger.hpp"
 
 namespace {
 
 uint64_t SegmentSizeBytes(const StorageConfig& storage) {
     return static_cast<uint64_t>(storage.wal_segment_size_mb) * 1024ULL * 1024ULL;
+}
+
+std::chrono::milliseconds RandomElectionTimeout(const RaftConfig& raft) {
+    thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<uint32_t> dist(raft.election_timeout_min_ms,
+                                                 raft.election_timeout_max_ms);
+    return std::chrono::milliseconds(dist(rng));
+}
+
+Result<std::string> ExtractRequestId(const LogEntry& entry) {
+    if (entry.type != EntryType::kNormal) {
+        return Result<std::string>::Ok({});
+    }
+
+    if (entry.cmd_type == CmdType::kUpsert) {
+        auto command = UpsertCmd::Deserialize(entry.payload);
+        if (!command) {
+            return Result<std::string>::Err(command.error);
+        }
+        return Result<std::string>::Ok(command->request_id);
+    }
+
+    if (entry.cmd_type == CmdType::kDelete) {
+        auto command = DeleteCmd::Deserialize(entry.payload);
+        if (!command) {
+            return Result<std::string>::Err(command.error);
+        }
+        return Result<std::string>::Ok(command->request_id);
+    }
+
+    return Result<std::string>::Ok({});
 }
 
 } // namespace
@@ -30,6 +65,14 @@ RaftNode::RaftNode(Config config,
       dedup_table_(std::move(options.dedup_table)),
       raft_client_(std::move(options.raft_client)) {
     voted_for_ = meta_.voted_for;
+    const auto now = std::chrono::steady_clock::now();
+    election_deadline_ = now + RandomElectionTimeout(config_.raft);
+    last_leader_contact_ = now;
+    last_topology_refresh_ = now;
+}
+
+RaftNode::~RaftNode() {
+    Stop();
 }
 
 Result<std::shared_ptr<RaftNode>> RaftNode::Create(const Config& config, RaftNodeOptions options) {
@@ -49,6 +92,14 @@ Result<std::shared_ptr<RaftNode>> RaftNode::Create(const Config& config, RaftNod
 
     auto topology = std::make_unique<TopologyManager>(config.cluster.node_id, options.self_addr);
     auto lease = std::make_unique<LeaseManager>();
+
+    if (!options.vector_index) {
+        auto index = VectorIndex::Create(config.vector);
+        if (!index) {
+            return Result<std::shared_ptr<RaftNode>>::Err(index.error);
+        }
+        options.vector_index = *index;
+    }
     if (!options.dedup_table) {
         options.dedup_table = std::make_shared<DedupTable>(config.client.dedup_window_size);
     }
@@ -56,38 +107,154 @@ Result<std::shared_ptr<RaftNode>> RaftNode::Create(const Config& config, RaftNod
         options.raft_client = std::make_shared<RaftClient>();
     }
 
-    auto node = std::shared_ptr<RaftNode>(new RaftNode(config, std::move(options), std::move(*wal),
-                                                       std::move(*meta), std::move(topology),
-                                                       std::move(lease)));
+    const bool auto_start = options.auto_start_background_loops;
+    auto node = std::shared_ptr<RaftNode>(
+        new RaftNode(config, std::move(options), std::move(*wal), std::move(*meta),
+                     std::move(topology), std::move(lease)));
     node->RegisterConfiguredPeers();
+    if (auto_start) {
+        auto start = node->Start();
+        if (!start) {
+            return Result<std::shared_ptr<RaftNode>>::Err(start.error);
+        }
+    }
     return Result<std::shared_ptr<RaftNode>>::Ok(std::move(node));
 }
 
+Result<void> RaftNode::Start() {
+    std::lock_guard lifecycle_lock(lifecycle_mutex_);
+    if (running_.exchange(true)) {
+        return Result<void>::Ok();
+    }
+
+    election_thread_ = std::jthread([this](std::stop_token stop_token) { ElectionLoop(stop_token); });
+    heartbeat_thread_ =
+        std::jthread([this](std::stop_token stop_token) { HeartbeatLoop(stop_token); });
+    replication_thread_ =
+        std::jthread([this](std::stop_token stop_token) { ReplicationLoop(stop_token); });
+    apply_thread_ = std::jthread([this](std::stop_token stop_token) { ApplyLoop(stop_token); });
+    maintenance_thread_ =
+        std::jthread([this](std::stop_token stop_token) { MaintenanceLoop(stop_token); });
+
+    // 单节点模式下不需要等待选举超时，启动后立即成为 Leader。
+    if (config_.cluster.peers.empty()) {
+        auto become_leader = BecomeLeader();
+        if (!become_leader) {
+            running_.store(false);
+            return become_leader;
+        }
+        lease_->Renew(std::chrono::milliseconds(config_.raft.lease_duration_ms));
+        auto maybe_commit = MaybeCommit();
+        if (!maybe_commit) {
+            running_.store(false);
+            return maybe_commit;
+        }
+    }
+
+    return Result<void>::Ok();
+}
+
+void RaftNode::Stop() {
+    std::jthread election_thread;
+    std::jthread heartbeat_thread;
+    std::jthread replication_thread;
+    std::jthread apply_thread;
+    std::jthread maintenance_thread;
+
+    {
+        std::lock_guard lifecycle_lock(lifecycle_mutex_);
+        if (!running_.exchange(false)) {
+            return;
+        }
+
+        election_thread = std::move(election_thread_);
+        heartbeat_thread = std::move(heartbeat_thread_);
+        replication_thread = std::move(replication_thread_);
+        apply_thread = std::move(apply_thread_);
+        maintenance_thread = std::move(maintenance_thread_);
+    }
+
+    election_thread.request_stop();
+    heartbeat_thread.request_stop();
+    replication_thread.request_stop();
+    apply_thread.request_stop();
+    maintenance_thread.request_stop();
+
+    const auto current_thread_id = std::this_thread::get_id();
+    if (election_thread.joinable() && election_thread.get_id() == current_thread_id) {
+        election_thread.detach();
+    }
+    if (heartbeat_thread.joinable() && heartbeat_thread.get_id() == current_thread_id) {
+        heartbeat_thread.detach();
+    }
+    if (replication_thread.joinable() && replication_thread.get_id() == current_thread_id) {
+        replication_thread.detach();
+    }
+    if (apply_thread.joinable() && apply_thread.get_id() == current_thread_id) {
+        apply_thread.detach();
+    }
+    if (maintenance_thread.joinable() && maintenance_thread.get_id() == current_thread_id) {
+        maintenance_thread.detach();
+    }
+
+    replicate_cv_.notify_all();
+    apply_cv_.notify_all();
+    heartbeat_cv_.notify_all();
+}
+
+bool RaftNode::IsRunning() const {
+    return running_.load(std::memory_order_acquire);
+}
+
 Result<uint64_t> RaftNode::Propose(const LogEntry& entry) {
-    std::lock_guard lock(state_mutex_);
+    std::lock_guard state_lock(state_mutex_);
     if (state_.load(std::memory_order_acquire) != RaftState::kLeader) {
         return Result<uint64_t>::Err("当前节点不是 Leader，无法执行 Propose");
     }
-    return AppendEntryLocked(entry);
+
+    auto appended = AppendEntryLocked(entry);
+    if (!appended) {
+        return appended;
+    }
+
+    auto request_id = ExtractRequestId(entry);
+    if (request_id && !request_id->empty()) {
+        dedup_table_->TrackPending(*request_id, *appended);
+    }
+
+    if (QuorumSize() == 1U) {
+        commit_index_.store(*appended, std::memory_order_release);
+        apply_cv_.notify_all();
+    } else {
+        RequestReplication();
+        RequestImmediateHeartbeat();
+    }
+
+    return appended;
 }
 
 Result<uint64_t> RaftNode::LeaseRead() {
-    if (!lease_->IsValid()) {
-        return Result<uint64_t>::Err("租约无效，当前不能执行 LeaseRead");
+    auto readable = EnsureLeaseReadable();
+    if (!readable) {
+        return Result<uint64_t>::Err(readable.error);
     }
+    return Result<uint64_t>::Ok(commit_index_.load(std::memory_order_acquire));
+}
 
-    const uint64_t commit_index = commit_index_.load(std::memory_order_acquire);
-    const uint64_t applied_index = applied_index_.load(std::memory_order_acquire);
-    if (applied_index < commit_index) {
-        return Result<uint64_t>::Err("状态机尚未追上 commit_index");
+Result<std::vector<VectorIndex::SearchResult>> RaftNode::LeaseRead(const float* vec,
+                                                                   size_t dim,
+                                                                   size_t top_k) {
+    auto readable = EnsureLeaseReadable();
+    if (!readable) {
+        return Result<std::vector<VectorIndex::SearchResult>>::Err(readable.error);
     }
-    return Result<uint64_t>::Ok(commit_index);
+    return vector_index_->Search(vec, dim, top_k);
 }
 
 Result<raftvdb::proto::AppendEntriesResponse> RaftNode::HandleAppendEntries(
     const raftvdb::proto::AppendEntriesRequest& request) {
     raftvdb::proto::AppendEntriesResponse response;
-    response.set_node_id(self_id_);
+    response.set_node_id(self_addr_.empty() ? self_id_ : self_addr_);
 
     uint64_t current_term = CurrentTerm();
     if (request.term() < current_term) {
@@ -97,29 +264,126 @@ Result<raftvdb::proto::AppendEntriesResponse> RaftNode::HandleAppendEntries(
         return Result<raftvdb::proto::AppendEntriesResponse>::Ok(std::move(response));
     }
 
-    auto become_follower = BecomeFollower(request.term(), request.leader_id());
-    if (!become_follower) {
-        return Result<raftvdb::proto::AppendEntriesResponse>::Err(become_follower.error);
+    {
+        std::lock_guard state_lock(state_mutex_);
+        current_term = current_term_.load(std::memory_order_acquire);
+        if (request.term() > current_term ||
+            state_.load(std::memory_order_acquire) != RaftState::kFollower) {
+            // 真实的降级路径仍复用 BecomeFollower，确保 term / voted_for / lease 处理一致。
+        } else {
+            leader_id_ = request.leader_id();
+            topology_->SetLeader(request.leader_id());
+            NoteLeaderContactLocked();
+        }
+    }
+    if (request.term() > current_term ||
+        state_.load(std::memory_order_acquire) != RaftState::kFollower) {
+        auto become_follower = BecomeFollower(request.term(), request.leader_id());
+        if (!become_follower) {
+            return Result<raftvdb::proto::AppendEntriesResponse>::Err(become_follower.error);
+        }
     }
 
     if (!request.topology().role().empty()) {
-        auto apply_topology =
-            topology_->FromProto(self_id_, request.topology(), self_addr_);
+        auto apply_topology = topology_->FromProto(self_id_, request.topology(), self_addr_);
         if (!apply_topology) {
             return Result<raftvdb::proto::AppendEntriesResponse>::Err(apply_topology.error);
         }
     }
 
-    response.set_term(CurrentTerm());
-    // T-18 仅实现状态切换骨架，真正的 prevLog 校验和日志写入将在 T-21 补齐。
-    // 因此这里仅在空 entries 场景下返回“当前状态可接受 Leader 请求”的保守成功。
-    if (request.entries_size() == 0) {
-        response.set_success(true);
-        response.set_match_index(wal_->LastIndex());
-    } else {
+    const uint64_t prev_log_index = request.prev_log_index();
+    if (prev_log_index > wal_->LastIndex()) {
+        response.set_term(CurrentTerm());
         response.set_success(false);
         response.set_conflict_index(wal_->LastIndex() + 1);
+        return Result<raftvdb::proto::AppendEntriesResponse>::Ok(std::move(response));
     }
+
+    if (prev_log_index > 0) {
+        auto prev_entry = wal_->Read(prev_log_index);
+        if (!prev_entry) {
+            response.set_term(CurrentTerm());
+            response.set_success(false);
+            response.set_conflict_index(prev_log_index);
+            return Result<raftvdb::proto::AppendEntriesResponse>::Ok(std::move(response));
+        }
+
+        if (prev_entry->term != request.prev_log_term()) {
+            response.set_term(CurrentTerm());
+            response.set_success(false);
+            response.set_conflict_term(prev_entry->term);
+
+            uint64_t conflict_index = prev_log_index;
+            while (conflict_index > 1) {
+                auto previous = wal_->Read(conflict_index - 1);
+                if (!previous || previous->term != prev_entry->term) {
+                    break;
+                }
+                --conflict_index;
+            }
+            response.set_conflict_index(conflict_index);
+            return Result<raftvdb::proto::AppendEntriesResponse>::Ok(std::move(response));
+        }
+    }
+
+    bool appended_any = false;
+    for (int index = 0; index < request.entries_size(); ++index) {
+        LogEntry incoming;
+        incoming.index = request.entries(index).index();
+        incoming.term = request.entries(index).term();
+        incoming.type = static_cast<EntryType>(request.entries(index).type());
+        incoming.cmd_type = static_cast<CmdType>(request.entries(index).cmd_type());
+        incoming.payload = request.entries(index).payload();
+
+        auto existing = wal_->Read(incoming.index);
+        if (existing) {
+            if (existing->term != incoming.term) {
+                auto truncate = wal_->TruncateSuffix(incoming.index);
+                if (!truncate) {
+                    return Result<raftvdb::proto::AppendEntriesResponse>::Err(truncate.error);
+                }
+            } else {
+                continue;
+            }
+        }
+
+        auto append_result = wal_->Append(incoming);
+        if (!append_result) {
+            return Result<raftvdb::proto::AppendEntriesResponse>::Err(append_result.error);
+        }
+        appended_any = true;
+    }
+
+    if (appended_any) {
+        auto flush_result = wal_->Flush();
+        if (!flush_result) {
+            return Result<raftvdb::proto::AppendEntriesResponse>::Err(flush_result.error);
+        }
+    }
+
+    const uint64_t bounded_commit = std::min<uint64_t>(request.leader_commit(), wal_->LastIndex());
+    const uint64_t previous_commit = commit_index_.exchange(bounded_commit, std::memory_order_acq_rel);
+    if (bounded_commit > previous_commit) {
+        apply_cv_.notify_all();
+    }
+
+    // Mentor 本地收到日志后，会再把相同日志转发给自己的下游 Follower。
+    // 这里选择异步转发，避免把 Leader -> Mentor 的 RPC 时延和下游网络耦合在一起。
+    auto self_role = topology_->GetRole(self_id_);
+    if (self_role == NodeRole::kMentor && request.entries_size() > 0) {
+        auto weak_self = weak_from_this();
+        const auto request_copy = request;
+        std::thread([weak_self, request_copy]() {
+            if (auto self = weak_self.lock()) {
+                auto ignored = self->ForwardToFollower(request_copy);
+                (void)ignored;
+            }
+        }).detach();
+    }
+
+    response.set_term(CurrentTerm());
+    response.set_success(true);
+    response.set_match_index(wal_->LastIndex());
     return Result<raftvdb::proto::AppendEntriesResponse>::Ok(std::move(response));
 }
 
@@ -141,9 +405,27 @@ Result<raftvdb::proto::RequestVoteResponse> RaftNode::HandleRequestVote(
         }
     }
 
+    {
+        std::lock_guard state_lock(state_mutex_);
+        const bool can_vote = voted_for_.empty() || voted_for_ == request.candidate_id();
+        const bool log_is_up_to_date =
+            IsCandidateLogUpToDateLocked(request.last_log_index(), request.last_log_term());
+
+        response.set_term(current_term_.load(std::memory_order_acquire));
+        if (can_vote && log_is_up_to_date) {
+            auto persist = PersistMetaLocked(request.term(), request.candidate_id());
+            if (!persist) {
+                return Result<raftvdb::proto::RequestVoteResponse>::Err(persist.error);
+            }
+            voted_for_ = request.candidate_id();
+            state_.store(RaftState::kFollower, std::memory_order_release);
+            NoteLeaderContactLocked();
+            response.set_vote_granted(true);
+            return Result<raftvdb::proto::RequestVoteResponse>::Ok(std::move(response));
+        }
+    }
+
     response.set_term(CurrentTerm());
-    // T-18 只把“更高 term 触发降级”这层骨架接好；
-    // 投票授权和日志新旧比较将在 T-19 的正式选举逻辑中实现。
     response.set_vote_granted(false);
     return Result<raftvdb::proto::RequestVoteResponse>::Ok(std::move(response));
 }
@@ -151,7 +433,7 @@ Result<raftvdb::proto::RequestVoteResponse> RaftNode::HandleRequestVote(
 Result<raftvdb::proto::HeartbeatResponse> RaftNode::HandleHeartbeat(
     const raftvdb::proto::HeartbeatRequest& request) {
     raftvdb::proto::HeartbeatResponse response;
-    response.set_node_id(self_id_);
+    response.set_node_id(self_addr_.empty() ? self_id_ : self_addr_);
 
     uint64_t current_term = CurrentTerm();
     if (request.term() < current_term) {
@@ -160,22 +442,38 @@ Result<raftvdb::proto::HeartbeatResponse> RaftNode::HandleHeartbeat(
         return Result<raftvdb::proto::HeartbeatResponse>::Ok(std::move(response));
     }
 
-    auto become_follower = BecomeFollower(request.term(), request.leader_id());
-    if (!become_follower) {
-        return Result<raftvdb::proto::HeartbeatResponse>::Err(become_follower.error);
+    {
+        std::lock_guard state_lock(state_mutex_);
+        current_term = current_term_.load(std::memory_order_acquire);
+        if (request.term() > current_term ||
+            state_.load(std::memory_order_acquire) != RaftState::kFollower) {
+            // 需要在锁外复用 BecomeFollower，以统一处理持久化和租约失效。
+        } else {
+            leader_id_ = request.leader_id();
+            topology_->SetLeader(request.leader_id());
+            NoteLeaderContactLocked();
+        }
+    }
+    if (request.term() > current_term ||
+        state_.load(std::memory_order_acquire) != RaftState::kFollower) {
+        auto become_follower = BecomeFollower(request.term(), request.leader_id());
+        if (!become_follower) {
+            return Result<raftvdb::proto::HeartbeatResponse>::Err(become_follower.error);
+        }
     }
 
     if (!request.topology().role().empty()) {
-        auto apply_topology =
-            topology_->FromProto(self_id_, request.topology(), self_addr_);
+        auto apply_topology = topology_->FromProto(self_id_, request.topology(), self_addr_);
         if (!apply_topology) {
             return Result<raftvdb::proto::HeartbeatResponse>::Err(apply_topology.error);
         }
     }
 
-    // 这里先保守推进本地 commit_index 视图，真正的心跳处理细节在 T-20 补齐。
     const uint64_t bounded_commit = std::min<uint64_t>(request.commit_index(), wal_->LastIndex());
-    commit_index_.store(bounded_commit, std::memory_order_release);
+    const uint64_t previous_commit = commit_index_.exchange(bounded_commit, std::memory_order_acq_rel);
+    if (bounded_commit > previous_commit) {
+        apply_cv_.notify_all();
+    }
 
     response.set_term(CurrentTerm());
     response.set_success(true);
@@ -201,7 +499,6 @@ Result<raftvdb::proto::InstallSnapshotResponse> RaftNode::HandleInstallSnapshot(
     }
 
     response.set_term(CurrentTerm());
-    // T-30 会在这里真正接收快照流、重建索引并恢复 DedupTable。
     response.set_success(false);
     return Result<raftvdb::proto::InstallSnapshotResponse>::Ok(std::move(response));
 }
@@ -235,14 +532,14 @@ uint64_t RaftNode::AppliedIndex() const {
 }
 
 std::string RaftNode::LeaderId() const {
-    std::lock_guard lock(state_mutex_);
+    std::lock_guard state_lock(state_mutex_);
     return leader_id_;
 }
 
 std::string RaftNode::LeaderAddr() const {
     std::string leader_id;
     {
-        std::lock_guard lock(state_mutex_);
+        std::lock_guard state_lock(state_mutex_);
         leader_id = leader_id_;
     }
 
@@ -261,7 +558,7 @@ std::string RaftNode::LeaderAddr() const {
 }
 
 Result<void> RaftNode::BecomeFollower(uint64_t term, const std::string& leader_id) {
-    std::lock_guard lock(state_mutex_);
+    std::lock_guard state_lock(state_mutex_);
     const uint64_t current_term = current_term_.load(std::memory_order_acquire);
     if (term < current_term) {
         return Result<void>::Err("BecomeFollower 失败: term 不能回退");
@@ -277,21 +574,20 @@ Result<void> RaftNode::BecomeFollower(uint64_t term, const std::string& leader_i
     leader_id_ = leader_id;
     state_.store(RaftState::kFollower, std::memory_order_release);
     lease_->Invalidate();
+    topology_->SetLeader(leader_id);
+    NoteLeaderContactLocked();
 
     {
         std::unique_lock progress_lock(peer_progress_mutex_);
         peer_progress_.clear();
     }
 
-    if (!leader_id.empty()) {
-        topology_->SetLeader(leader_id);
-    }
-
+    LOG_INFO("RAFT_BECOME_FOLLOWER", "node_id={}, term={}, leader_id={}", self_id_, term, leader_id);
     return Result<void>::Ok();
 }
 
 Result<void> RaftNode::BecomeCandidate() {
-    std::lock_guard lock(state_mutex_);
+    std::lock_guard state_lock(state_mutex_);
     const uint64_t next_term = current_term_.load(std::memory_order_acquire) + 1;
 
     auto persist = PersistMetaLocked(next_term, self_id_);
@@ -304,21 +600,21 @@ Result<void> RaftNode::BecomeCandidate() {
     leader_id_.clear();
     state_.store(RaftState::kCandidate, std::memory_order_release);
     lease_->Invalidate();
+    ResetElectionDeadlineLocked();
 
     {
         std::unique_lock progress_lock(peer_progress_mutex_);
         peer_progress_.clear();
     }
 
+    LOG_INFO("RAFT_BECOME_CANDIDATE", "node_id={}, term={}", self_id_, next_term);
     return Result<void>::Ok();
 }
 
 Result<void> RaftNode::BecomeLeader() {
-    std::lock_guard lock(state_mutex_);
+    std::lock_guard state_lock(state_mutex_);
     uint64_t term = current_term_.load(std::memory_order_acquire);
     if (term == 0) {
-        // 单节点或测试直切 Leader 时，仍需把任期推进到一个有效正值，
-        // 避免后续追加的 kNoop 落在 term=0 这种不自然状态。
         term = 1;
         auto persist = PersistMetaLocked(term, self_id_);
         if (!persist) {
@@ -330,6 +626,10 @@ Result<void> RaftNode::BecomeLeader() {
 
     leader_id_ = self_id_;
     topology_->SetLeader(self_id_, self_addr_);
+    auto rebalance = topology_->Rebalance(config_.cluster.peers);
+    if (!rebalance) {
+        return rebalance;
+    }
 
     auto noop_index = AppendNoopEntryLocked();
     if (!noop_index) {
@@ -337,15 +637,176 @@ Result<void> RaftNode::BecomeLeader() {
     }
 
     ResetPeerProgressLocked(*noop_index + 1);
-
-    auto rebalance = topology_->Rebalance(config_.cluster.peers);
-    if (!rebalance) {
-        return rebalance;
-    }
-
     state_.store(RaftState::kLeader, std::memory_order_release);
     lease_->Invalidate();
+    last_topology_refresh_ = std::chrono::steady_clock::now();
+
+    LOG_INFO("RAFT_BECOME_LEADER", "node_id={}, term={}, noop_index={}", self_id_, term,
+             *noop_index);
+    RequestReplication();
+    RequestImmediateHeartbeat();
     return Result<void>::Ok();
+}
+
+Result<void> RaftNode::PersistMetaLocked(uint64_t term, const std::string& voted_for) {
+    RaftMeta next_meta;
+    next_meta.current_term = term;
+    next_meta.voted_for = voted_for;
+    auto save = next_meta.Save(MetaPath());
+    if (!save) {
+        return save;
+    }
+    meta_ = std::move(next_meta);
+    return Result<void>::Ok();
+}
+
+Result<void> RaftNode::StartElection() {
+    auto become_candidate = BecomeCandidate();
+    if (!become_candidate) {
+        return become_candidate;
+    }
+
+    raftvdb::proto::RequestVoteRequest request;
+    request.set_term(CurrentTerm());
+    request.set_candidate_id(self_id_);
+    request.set_last_log_index(wal_->LastIndex());
+    {
+        std::lock_guard state_lock(state_mutex_);
+        request.set_last_log_term(LastLogTermLocked());
+    }
+
+    std::atomic<size_t> granted_votes{1};
+    std::mutex response_mutex;
+    uint64_t highest_term = request.term();
+
+    std::vector<std::thread> threads;
+    threads.reserve(config_.cluster.peers.size());
+    for (const auto& peer : config_.cluster.peers) {
+        threads.emplace_back([&, peer]() {
+            auto response = raft_client_->RequestVote(ResolvePeerAddress(peer), request);
+            if (!response) {
+                return;
+            }
+
+            std::lock_guard lock(response_mutex);
+            if (response->term() > highest_term) {
+                highest_term = response->term();
+            }
+            if (response->vote_granted()) {
+                ++granted_votes;
+            }
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    if (highest_term > request.term()) {
+        return BecomeFollower(highest_term);
+    }
+
+    {
+        std::lock_guard state_lock(state_mutex_);
+        if (state_.load(std::memory_order_acquire) != RaftState::kCandidate ||
+            current_term_.load(std::memory_order_acquire) != request.term()) {
+            return Result<void>::Ok();
+        }
+    }
+
+    if (granted_votes.load() >= QuorumSize()) {
+        auto become_leader = BecomeLeader();
+        if (!become_leader) {
+            return become_leader;
+        }
+        auto maybe_commit = MaybeCommit();
+        if (!maybe_commit) {
+            return maybe_commit;
+        }
+    }
+
+    return Result<void>::Ok();
+}
+
+Result<void> RaftNode::BroadcastHeartbeat(bool /*allow_async_callbacks*/) {
+    if (!IsLeader()) {
+        return Result<void>::Ok();
+    }
+
+    const uint64_t term = CurrentTerm();
+    const uint64_t commit_index = CommitIndex();
+    size_t success_count = 1;
+    uint64_t highest_term = term;
+
+    for (const auto& peer : config_.cluster.peers) {
+        raftvdb::proto::HeartbeatRequest request;
+        request.set_term(term);
+        request.set_leader_id(self_id_);
+        request.set_commit_index(commit_index);
+
+        auto topology = BuildTopologyForPeer(peer);
+        if (topology) {
+            *request.mutable_topology() = *topology;
+        }
+
+        auto sent_at = std::chrono::steady_clock::now();
+        auto response = raft_client_->Heartbeat(ResolvePeerAddress(peer), request);
+        if (!response) {
+            UpdatePeerFailure(peer);
+            continue;
+        }
+        if (response->term() > highest_term) {
+            highest_term = response->term();
+            continue;
+        }
+        if (response->success()) {
+            ++success_count;
+            UpdatePeerHeartbeatAck(peer, sent_at);
+        } else {
+            UpdatePeerFailure(peer);
+        }
+    }
+
+    if (highest_term > term) {
+        return BecomeFollower(highest_term);
+    }
+
+    if (success_count >= QuorumSize()) {
+        lease_->Renew(std::chrono::milliseconds(config_.raft.lease_duration_ms));
+    }
+    return Result<void>::Ok();
+}
+
+void RaftNode::ResetElectionDeadlineLocked() {
+    const auto now = std::chrono::steady_clock::now();
+    last_leader_contact_ = now;
+    election_deadline_ = now + RandomElectionTimeout(config_.raft);
+}
+
+void RaftNode::NoteLeaderContactLocked() {
+    ResetElectionDeadlineLocked();
+}
+
+uint64_t RaftNode::LastLogTermLocked() {
+    const uint64_t last_index = wal_->LastIndex();
+    if (last_index == 0) {
+        return 0;
+    }
+    auto term = wal_->TermAt(last_index);
+    if (!term) {
+        return 0;
+    }
+    return *term;
+}
+
+bool RaftNode::IsCandidateLogUpToDateLocked(uint64_t candidate_last_log_index,
+                                            uint64_t candidate_last_log_term) {
+    const uint64_t local_last_log_term = LastLogTermLocked();
+    const uint64_t local_last_log_index = wal_->LastIndex();
+    if (candidate_last_log_term != local_last_log_term) {
+        return candidate_last_log_term > local_last_log_term;
+    }
+    return candidate_last_log_index >= local_last_log_index;
 }
 
 Result<uint64_t> RaftNode::AppendEntryLocked(const LogEntry& entry) {
@@ -372,24 +833,215 @@ Result<uint64_t> RaftNode::AppendNoopEntryLocked() {
     return AppendEntryLocked(noop);
 }
 
-Result<void> RaftNode::PersistMetaLocked(uint64_t term, const std::string& voted_for) {
-    RaftMeta next_meta;
-    next_meta.current_term = term;
-    next_meta.voted_for = voted_for;
-    auto save = next_meta.Save(MetaPath());
-    if (!save) {
-        return save;
+Result<void> RaftNode::MaybeCommit() {
+    if (!IsLeader()) {
+        return Result<void>::Ok();
     }
-    meta_ = std::move(next_meta);
+
+    const uint64_t last_index = wal_->LastIndex();
+    uint64_t new_commit = commit_index_.load(std::memory_order_acquire);
+    for (uint64_t candidate = last_index; candidate > new_commit; --candidate) {
+        auto term = wal_->TermAt(candidate);
+        if (!term) {
+            return Result<void>::Err(term.error);
+        }
+        if (*term != CurrentTerm()) {
+            continue;
+        }
+
+        size_t matched = 1; // Leader 自身天然匹配。
+        {
+            std::shared_lock progress_lock(peer_progress_mutex_);
+            for (const auto& [_, progress] : peer_progress_) {
+                if (progress.match_index >= candidate) {
+                    ++matched;
+                }
+            }
+        }
+
+        if (matched >= QuorumSize()) {
+            new_commit = candidate;
+            break;
+        }
+    }
+
+    const uint64_t previous_commit = commit_index_.load(std::memory_order_acquire);
+    if (new_commit > previous_commit) {
+        commit_index_.store(new_commit, std::memory_order_release);
+        apply_cv_.notify_all();
+        RequestImmediateHeartbeat();
+    }
     return Result<void>::Ok();
 }
 
+Result<void> RaftNode::ReplicatePeerOnce(const std::string& peer_id) {
+    if (!IsLeader()) {
+        return Result<void>::Ok();
+    }
+
+    PeerProgress snapshot;
+    {
+        std::shared_lock progress_lock(peer_progress_mutex_);
+        auto found = peer_progress_.find(peer_id);
+        if (found == peer_progress_.end()) {
+            return Result<void>::Ok();
+        }
+        snapshot = found->second;
+    }
+
+    const uint32_t window_size =
+        snapshot.effective_window_size == 0 ? config_.raft.pipeline_window_size
+                                            : snapshot.effective_window_size;
+    if (snapshot.in_flight >= window_size) {
+        return Result<void>::Ok();
+    }
+
+    auto entries = wal_->ReadFrom(snapshot.next_index, config_.raft.batch_max_entries);
+    if (!entries) {
+        return Result<void>::Err(entries.error);
+    }
+    if (entries->empty()) {
+        return Result<void>::Ok();
+    }
+
+    raftvdb::proto::AppendEntriesRequest request;
+    request.set_term(CurrentTerm());
+    request.set_leader_id(self_id_);
+    request.set_prev_log_index(snapshot.next_index - 1);
+    auto prev_term = wal_->TermAt(snapshot.next_index - 1);
+    if (!prev_term) {
+        return Result<void>::Err(prev_term.error);
+    }
+    request.set_prev_log_term(*prev_term);
+    request.set_leader_commit(CommitIndex());
+
+    auto topology = BuildTopologyForPeer(peer_id);
+    if (topology) {
+        *request.mutable_topology() = *topology;
+    }
+
+    for (const auto& entry : *entries) {
+        auto* proto_entry = request.add_entries();
+        proto_entry->set_index(entry.index);
+        proto_entry->set_term(entry.term);
+        proto_entry->set_type(static_cast<uint32_t>(entry.type));
+        proto_entry->set_cmd_type(static_cast<uint32_t>(entry.cmd_type));
+        proto_entry->set_payload(entry.payload);
+    }
+
+    const auto sent_at = std::chrono::steady_clock::now();
+    {
+        std::unique_lock progress_lock(peer_progress_mutex_);
+        auto& progress = peer_progress_[peer_id];
+        progress.in_flight += 1;
+        progress.last_send_time = sent_at;
+        progress.next_index += static_cast<uint64_t>(entries->size());
+    }
+
+    auto weak_self = weak_from_this();
+    const auto request_copy = request;
+    auto async_result = raft_client_->AppendEntriesAsync(
+        ResolvePeerAddress(peer_id), request,
+        [weak_self, peer_id, sent_at, request_copy](Result<raftvdb::proto::AppendEntriesResponse> result) {
+            auto self = weak_self.lock();
+            if (!self) {
+                return;
+            }
+            if (!result) {
+                self->UpdatePeerFailure(peer_id);
+                self->RequestReplication();
+                return;
+            }
+
+            if (result->term() > self->CurrentTerm()) {
+                auto ignored = self->BecomeFollower(result->term());
+                (void)ignored;
+                return;
+            }
+            if (!self->IsLeader()) {
+                return;
+            }
+
+            if (result->success()) {
+                self->UpdatePeerAck(peer_id, result->match_index(), sent_at);
+                auto maybe_commit = self->MaybeCommit();
+                (void)maybe_commit;
+            } else {
+                std::unique_lock progress_lock(self->peer_progress_mutex_);
+                auto found = self->peer_progress_.find(peer_id);
+                if (found != self->peer_progress_.end()) {
+                    found->second.in_flight = 0;
+                    found->second.next_index =
+                        result->conflict_index() == 0 ? request_copy.prev_log_index()
+                                                      : result->conflict_index();
+                    found->second.healthy = true;
+                }
+            }
+            self->RequestReplication();
+        });
+
+    if (!async_result) {
+        UpdatePeerFailure(peer_id);
+        return Result<void>::Err(async_result.error);
+    }
+
+    return Result<void>::Ok();
+}
+
+Result<void> RaftNode::ForwardToFollower(const raftvdb::proto::AppendEntriesRequest& request) {
+    auto follower = topology_->GetFollowerOf(self_id_);
+    if (!follower || !follower->healthy) {
+        return Result<void>::Ok();
+    }
+
+    raftvdb::proto::AppendEntriesRequest forwarded = request;
+    auto topology = BuildTopologyForPeer(follower->node_id);
+    if (topology) {
+        *forwarded.mutable_topology() = *topology;
+    } else {
+        forwarded.clear_topology();
+    }
+
+    const auto sent_at = std::chrono::steady_clock::now();
+    auto response = raft_client_->AppendEntries(ResolvePeerAddress(follower->node_id), forwarded);
+    if (!response) {
+        UpdatePeerFailure(follower->node_id);
+        return Result<void>::Err(response.error);
+    }
+
+    if (response->term() > CurrentTerm()) {
+        auto become_follower = BecomeFollower(response->term());
+        if (!become_follower) {
+            return become_follower;
+        }
+        return Result<void>::Ok();
+    }
+
+    if (response->success()) {
+        UpdatePeerAck(follower->node_id, response->match_index(), sent_at);
+        return Result<void>::Ok();
+    }
+
+    std::unique_lock progress_lock(peer_progress_mutex_);
+    auto& progress = peer_progress_[follower->node_id];
+    progress.peer_id = follower->node_id;
+    progress.in_flight = 0;
+    progress.next_index = response->conflict_index() == 0 ? progress.next_index
+                                                          : response->conflict_index();
+    progress.healthy = true;
+    return Result<void>::Ok();
+}
+
+Result<raftvdb::proto::TopologyInfo> RaftNode::BuildTopologyForPeer(const std::string& peer_id) const {
+    return topology_->ToProto(peer_id);
+}
+
 void RaftNode::ResetPeerProgressLocked(uint64_t next_index) {
-    std::unique_lock lock(peer_progress_mutex_);
+    std::unique_lock progress_lock(peer_progress_mutex_);
     peer_progress_.clear();
     const auto now = std::chrono::steady_clock::now();
     for (const auto& peer : config_.cluster.peers) {
-        if (peer.empty() || peer == self_id_ || peer == self_addr_) {
+        if (peer.empty() || peer == self_id_) {
             continue;
         }
 
@@ -399,21 +1051,588 @@ void RaftNode::ResetPeerProgressLocked(uint64_t next_index) {
         progress.match_index = 0;
         progress.in_flight = 0;
         progress.healthy = true;
+        progress.direct_mode = false;
+        progress.effective_window_size = config_.raft.pipeline_window_size;
         progress.last_ack_time = now;
+        progress.last_send_time = now;
+        progress.recover_deadline = now;
         peer_progress_[peer] = progress;
     }
+}
+
+void RaftNode::UpdatePeerAck(const std::string& peer_id,
+                             uint64_t match_index,
+                             std::chrono::steady_clock::time_point sent_at) {
+    const auto now = std::chrono::steady_clock::now();
+    std::unique_lock progress_lock(peer_progress_mutex_);
+    auto& progress = peer_progress_[peer_id];
+    progress.peer_id = peer_id;
+    progress.match_index = std::max(progress.match_index, match_index);
+    progress.next_index = std::max(progress.next_index, match_index + 1);
+    if (progress.in_flight > 0) {
+        progress.in_flight -= 1;
+    }
+    progress.healthy = true;
+    progress.last_ack_time = now;
+
+    const double sample_ms =
+        static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(now - sent_at).count());
+    progress.avg_ack_latency_ms =
+        ((progress.avg_ack_latency_ms * static_cast<double>(progress.ack_samples)) + sample_ms) /
+        static_cast<double>(progress.ack_samples + 1U);
+    progress.ack_samples += 1;
+    if (match_index >= wal_->LastIndex() &&
+        (progress.direct_mode ||
+         progress.effective_window_size != config_.raft.pipeline_window_size)) {
+        topology_refresh_requested_ = true;
+    }
+}
+
+void RaftNode::UpdatePeerHeartbeatAck(const std::string& peer_id,
+                                      std::chrono::steady_clock::time_point sent_at) {
+    const auto now = std::chrono::steady_clock::now();
+    std::unique_lock progress_lock(peer_progress_mutex_);
+    auto& progress = peer_progress_[peer_id];
+    progress.peer_id = peer_id;
+    progress.healthy = true;
+    progress.last_ack_time = now;
+
+    const double sample_ms =
+        static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(now - sent_at).count());
+    progress.avg_ack_latency_ms =
+        ((progress.avg_ack_latency_ms * static_cast<double>(progress.ack_samples)) + sample_ms) /
+        static_cast<double>(progress.ack_samples + 1U);
+    progress.ack_samples += 1;
+}
+
+void RaftNode::UpdatePeerFailure(const std::string& peer_id) {
+    std::unique_lock progress_lock(peer_progress_mutex_);
+    auto& progress = peer_progress_[peer_id];
+    progress.peer_id = peer_id;
+    if (progress.in_flight > 0) {
+        progress.in_flight -= 1;
+    }
+}
+
+void RaftNode::RequestReplication() {
+    {
+        std::lock_guard lock(replicate_mutex_);
+        replicate_requested_ = true;
+    }
+    replicate_cv_.notify_one();
+}
+
+void RaftNode::RequestImmediateHeartbeat() {
+    {
+        std::lock_guard lock(heartbeat_mutex_);
+        heartbeat_requested_ = true;
+    }
+    heartbeat_cv_.notify_one();
+}
+
+void RaftNode::ApplyCommittedEntries() {
+    while (applied_index_.load(std::memory_order_acquire) < commit_index_.load(std::memory_order_acquire)) {
+        const uint64_t next_index = applied_index_.load(std::memory_order_acquire) + 1;
+        auto entry = wal_->Read(next_index);
+        if (!entry) {
+            LOG_ERROR("APPLY_READ_FAILED", "node_id={}, index={}, error={}", self_id_, next_index,
+                      entry.error);
+            return;
+        }
+
+        bool success = true;
+        std::string error;
+        std::string request_id;
+
+        if (entry->type == EntryType::kNormal) {
+            if (entry->cmd_type == CmdType::kUpsert) {
+                auto command = UpsertCmd::Deserialize(entry->payload);
+                if (!command) {
+                    success = false;
+                    error = command.error;
+                } else {
+                    request_id = command->request_id;
+                    auto upsert = vector_index_->Upsert(command->id, command->vector.data(),
+                                                        command->vector.size());
+                    success = static_cast<bool>(upsert);
+                    if (!success) {
+                        error = upsert.error;
+                    }
+                }
+            } else if (entry->cmd_type == CmdType::kDelete) {
+                auto command = DeleteCmd::Deserialize(entry->payload);
+                if (!command) {
+                    success = false;
+                    error = command.error;
+                } else {
+                    request_id = command->request_id;
+                    auto deleted = vector_index_->Delete(command->id);
+                    success = static_cast<bool>(deleted);
+                    if (!success) {
+                        error = deleted.error;
+                    }
+                }
+            }
+        }
+
+        if (!request_id.empty()) {
+            dedup_table_->Record(request_id, next_index, success, error);
+        }
+
+        applied_index_.store(next_index, std::memory_order_release);
+        if (config_.raft.snapshot_threshold > 0 &&
+            next_index % config_.raft.snapshot_threshold == 0) {
+            LOG_INFO("SNAPSHOT_THRESHOLD_REACHED", "node_id={}, applied_index={}", self_id_,
+                     next_index);
+        }
+    }
+}
+
+Result<void> RaftNode::EnsureLeaseReadable() {
+    if (!IsLeader()) {
+        return Result<void>::Err("当前节点不是 Leader，无法执行租约读");
+    }
+
+    if (!lease_->IsValid()) {
+        auto refresh = BroadcastHeartbeat(false);
+        if (!refresh) {
+            return refresh;
+        }
+        if (!lease_->IsValid()) {
+            return Result<void>::Err("租约无效，心跳续约未成功");
+        }
+    }
+
+    if (applied_index_.load(std::memory_order_acquire) <
+        commit_index_.load(std::memory_order_acquire)) {
+        std::unique_lock lock(apply_mutex_);
+        apply_cv_.wait_for(lock, std::chrono::milliseconds(500), [this]() {
+            return applied_index_.load(std::memory_order_acquire) >=
+                   commit_index_.load(std::memory_order_acquire);
+        });
+    }
+
+    if (applied_index_.load(std::memory_order_acquire) <
+        commit_index_.load(std::memory_order_acquire)) {
+        return Result<void>::Err("状态机尚未追上 commit_index");
+    }
+    return Result<void>::Ok();
+}
+
+void RaftNode::CheckMentorTimeouts() {
+    if (!IsLeader()) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto mentor_timeout = std::chrono::milliseconds(config_.raft.mentor_ack_timeout_ms);
+
+    for (const auto& mentor : topology_->GetMentors()) {
+        PeerProgress progress;
+        {
+            std::shared_lock progress_lock(peer_progress_mutex_);
+            auto found = peer_progress_.find(mentor.node_id);
+            if (found == peer_progress_.end()) {
+                continue;
+            }
+            progress = found->second;
+        }
+
+        if (now - progress.last_ack_time <= mentor_timeout) {
+            continue;
+        }
+
+        LOG_WARN("MENTOR_TIMEOUT", "leader_id={}, mentor_id={}", self_id_, mentor.node_id);
+        auto follower = topology_->GetFollowerOf(mentor.node_id);
+        topology_->MarkUnhealthy(mentor.node_id);
+        UpdatePeerFailure(mentor.node_id);
+
+        if (follower && follower->healthy) {
+            raftvdb::proto::HeartbeatRequest request;
+            request.set_term(CurrentTerm());
+            request.set_leader_id(self_id_);
+            request.set_commit_index(CommitIndex());
+            auto topo = BuildTopologyForPeer(follower->node_id);
+            if (topo) {
+                *request.mutable_topology() = *topo;
+            }
+
+            auto sent_at = std::chrono::steady_clock::now();
+            auto response = raft_client_->Heartbeat(ResolvePeerAddress(follower->node_id), request);
+            if (response && response->success()) {
+                topology_->PromoteToMentor(follower->node_id);
+                UpdatePeerHeartbeatAck(follower->node_id, sent_at);
+                topology_refresh_requested_ = true;
+                RequestImmediateHeartbeat();
+                continue;
+            }
+
+            topology_->MarkUnhealthy(follower->node_id);
+        }
+
+        if (HealthyPeerIds().size() + 1U < QuorumSize()) {
+            LOG_WARN("CLUSTER_DEGRADED", "leader_id={}, quorum={}, healthy={}", self_id_,
+                     QuorumSize(), HealthyPeerIds().size() + 1U);
+        }
+    }
+}
+
+void RaftNode::CheckFollowerTimeouts() {
+    if (!IsLeader()) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto follower_timeout =
+        std::chrono::milliseconds(config_.raft.mentor_ack_timeout_ms * 2U);
+
+    for (const auto& node : topology_->AllNodes()) {
+        if (node.node_id == self_id_ || node.role != NodeRole::kFollower || !node.healthy) {
+            continue;
+        }
+
+        PeerProgress follower_progress;
+        {
+            std::shared_lock progress_lock(peer_progress_mutex_);
+            auto found = peer_progress_.find(node.node_id);
+            if (found == peer_progress_.end()) {
+                continue;
+            }
+            follower_progress = found->second;
+        }
+
+        if (now - follower_progress.last_ack_time <= follower_timeout) {
+            continue;
+        }
+
+        const auto mentor = topology_->GetMentorOf(node.node_id);
+        bool mentor_recent = false;
+        std::string mentor_id;
+        if (mentor && mentor->healthy) {
+            mentor_id = mentor->node_id;
+            std::shared_lock progress_lock(peer_progress_mutex_);
+            auto found = peer_progress_.find(mentor_id);
+            if (found != peer_progress_.end()) {
+                mentor_recent = now - found->second.last_ack_time <=
+                                std::chrono::milliseconds(config_.raft.mentor_ack_timeout_ms);
+            }
+        }
+
+        bool follower_ok = false;
+        const auto sent_at = std::chrono::steady_clock::now();
+        if (follower_progress.next_index <= wal_->LastIndex()) {
+            raftvdb::proto::AppendEntriesRequest request;
+            request.set_term(CurrentTerm());
+            request.set_leader_id(self_id_);
+            request.set_prev_log_index(follower_progress.next_index - 1);
+            auto prev_term = wal_->TermAt(follower_progress.next_index - 1);
+            if (prev_term) {
+                request.set_prev_log_term(*prev_term);
+            }
+            request.set_leader_commit(CommitIndex());
+            auto topo = BuildTopologyForPeer(node.node_id);
+            if (topo) {
+                *request.mutable_topology() = *topo;
+            }
+
+            auto entries = wal_->ReadFrom(follower_progress.next_index, config_.raft.batch_max_entries);
+            if (entries) {
+                for (const auto& entry : *entries) {
+                    auto* proto_entry = request.add_entries();
+                    proto_entry->set_index(entry.index);
+                    proto_entry->set_term(entry.term);
+                    proto_entry->set_type(static_cast<uint32_t>(entry.type));
+                    proto_entry->set_cmd_type(static_cast<uint32_t>(entry.cmd_type));
+                    proto_entry->set_payload(entry.payload);
+                }
+            }
+
+            auto response = raft_client_->AppendEntries(ResolvePeerAddress(node.node_id), request);
+            if (response && response->success()) {
+                follower_ok = true;
+                UpdatePeerAck(node.node_id, response->match_index(), sent_at);
+            }
+        } else {
+            raftvdb::proto::HeartbeatRequest request;
+            request.set_term(CurrentTerm());
+            request.set_leader_id(self_id_);
+            request.set_commit_index(CommitIndex());
+            auto topo = BuildTopologyForPeer(node.node_id);
+            if (topo) {
+                *request.mutable_topology() = *topo;
+            }
+
+            auto response = raft_client_->Heartbeat(ResolvePeerAddress(node.node_id), request);
+            if (response && response->success()) {
+                follower_ok = true;
+                UpdatePeerHeartbeatAck(node.node_id, sent_at);
+            }
+        }
+
+        if (follower_ok) {
+            if (!mentor_recent) {
+                topology_->PromoteToMentor(node.node_id);
+                if (!mentor_id.empty()) {
+                    topology_->MarkUnhealthy(mentor_id);
+                }
+                topology_refresh_requested_ = true;
+                continue;
+            }
+
+            std::unique_lock progress_lock(peer_progress_mutex_);
+            auto mentor_it = peer_progress_.find(mentor_id);
+            auto follower_it = peer_progress_.find(node.node_id);
+            if (mentor_it == peer_progress_.end() || follower_it == peer_progress_.end()) {
+                continue;
+            }
+
+            // 低样本或高延迟时，优先按“处理能力受限”处理：降低 Mentor 窗口，
+            // 同时允许 Leader 临时直发该 Follower。
+            if (mentor_it->second.ack_samples < 3 ||
+                mentor_it->second.avg_ack_latency_ms >
+                    static_cast<double>(config_.raft.heartbeat_interval_ms * 2U) ||
+                mentor_it->second.match_index + 1 < wal_->LastIndex()) {
+                mentor_it->second.effective_window_size =
+                    std::max<uint32_t>(1U, config_.raft.pipeline_window_size / 2U);
+                mentor_it->second.recover_deadline =
+                    now + std::chrono::milliseconds(config_.raft.mentor_recover_timeout_ms);
+                follower_it->second.direct_mode = true;
+            } else {
+                // 更像链路阻塞时，优先尝试交换绑定；若没有可交换 Mentor，则退化为直发。
+                auto mentors = topology_->GetMentors();
+                auto other = std::find_if(mentors.begin(), mentors.end(), [&](const NodeInfo& info) {
+                    return info.node_id != mentor_id && info.healthy;
+                });
+                if (other != mentors.end()) {
+                    topology_->SwapFollowers(mentor_id, other->node_id);
+                } else {
+                    follower_it->second.direct_mode = true;
+                }
+                topology_refresh_requested_ = true;
+            }
+            continue;
+        }
+
+        if (mentor_recent) {
+            topology_->MarkUnhealthy(node.node_id);
+        } else if (HealthyPeerIds().size() + 1U < QuorumSize()) {
+            LOG_WARN("CLUSTER_DEGRADED", "leader_id={}, quorum={}, healthy={}", self_id_,
+                     QuorumSize(), HealthyPeerIds().size() + 1U);
+        }
+    }
+}
+
+Result<void> RaftNode::RebalanceTopology() {
+    auto rebalance = topology_->Rebalance(HealthyPeerIds());
+    if (!rebalance) {
+        return rebalance;
+    }
+
+    {
+        std::unique_lock progress_lock(peer_progress_mutex_);
+        for (auto& [_, progress] : peer_progress_) {
+            progress.direct_mode = false;
+            progress.effective_window_size = config_.raft.pipeline_window_size;
+        }
+    }
+
+    last_topology_refresh_ = std::chrono::steady_clock::now();
+    topology_refresh_requested_ = false;
+    RequestImmediateHeartbeat();
+    return Result<void>::Ok();
+}
+
+std::vector<std::string> RaftNode::HealthyPeerIds() const {
+    std::vector<std::string> healthy;
+    for (const auto& node : topology_->AllNodes()) {
+        if (node.node_id != self_id_ && node.healthy) {
+            healthy.push_back(node.node_id);
+        }
+    }
+    return healthy;
+}
+
+void RaftNode::ElectionLoop(std::stop_token stop_token) {
+    while (!stop_token.stop_requested()) {
+        if (IsLeader()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+
+        std::chrono::steady_clock::time_point deadline;
+        {
+            std::lock_guard state_lock(state_mutex_);
+            deadline = election_deadline_;
+        }
+
+        if (std::chrono::steady_clock::now() >= deadline) {
+            auto start_election = StartElection();
+            if (!start_election) {
+                LOG_WARN("ELECTION_FAILED", "node_id={}, error={}", self_id_, start_election.error);
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+void RaftNode::HeartbeatLoop(std::stop_token stop_token) {
+    const auto interval = std::chrono::milliseconds(config_.raft.heartbeat_interval_ms);
+    while (!stop_token.stop_requested()) {
+        std::unique_lock lock(heartbeat_mutex_);
+        heartbeat_cv_.wait_for(lock, interval, [this, &stop_token]() {
+            return stop_token.stop_requested() || heartbeat_requested_;
+        });
+        const bool requested = heartbeat_requested_;
+        heartbeat_requested_ = false;
+        lock.unlock();
+
+        if (stop_token.stop_requested()) {
+            return;
+        }
+        if (!requested && !IsLeader()) {
+            continue;
+        }
+        if (!IsLeader()) {
+            continue;
+        }
+
+        auto heartbeat = BroadcastHeartbeat(false);
+        if (!heartbeat) {
+            LOG_WARN("HEARTBEAT_ROUND_FAILED", "node_id={}, error={}", self_id_, heartbeat.error);
+        }
+    }
+}
+
+void RaftNode::ReplicationLoop(std::stop_token stop_token) {
+    const auto flush_interval = std::chrono::microseconds(config_.raft.batch_flush_interval_us);
+    while (!stop_token.stop_requested()) {
+        std::unique_lock lock(replicate_mutex_);
+        replicate_cv_.wait_for(lock, flush_interval, [this, &stop_token]() {
+            return stop_token.stop_requested() || replicate_requested_;
+        });
+        replicate_requested_ = false;
+        lock.unlock();
+
+        if (stop_token.stop_requested()) {
+            return;
+        }
+        if (!IsLeader()) {
+            continue;
+        }
+
+        for (const auto& node : topology_->AllNodes()) {
+            if (node.node_id == self_id_ || !node.healthy) {
+                continue;
+            }
+
+            bool should_replicate = node.role == NodeRole::kMentor || node.source_node_id == self_id_;
+            {
+                std::shared_lock progress_lock(peer_progress_mutex_);
+                auto found = peer_progress_.find(node.node_id);
+                if (found != peer_progress_.end() && found->second.direct_mode) {
+                    should_replicate = true;
+                }
+            }
+            if (!should_replicate) {
+                continue;
+            }
+
+            auto replicate = ReplicatePeerOnce(node.node_id);
+            if (!replicate) {
+                LOG_WARN("REPLICATE_PEER_FAILED", "leader_id={}, peer_id={}, error={}", self_id_,
+                         node.node_id, replicate.error);
+            }
+        }
+    }
+}
+
+void RaftNode::ApplyLoop(std::stop_token stop_token) {
+    while (!stop_token.stop_requested()) {
+        std::unique_lock lock(apply_mutex_);
+        apply_cv_.wait_for(lock, std::chrono::milliseconds(50), [this, &stop_token]() {
+            return stop_token.stop_requested() ||
+                   applied_index_.load(std::memory_order_acquire) <
+                       commit_index_.load(std::memory_order_acquire);
+        });
+        lock.unlock();
+
+        if (stop_token.stop_requested()) {
+            return;
+        }
+        ApplyCommittedEntries();
+    }
+}
+
+void RaftNode::MaintenanceLoop(std::stop_token stop_token) {
+    const auto interval = std::chrono::milliseconds(
+        std::max<uint32_t>(20U, std::min(config_.raft.heartbeat_interval_ms,
+                                         config_.raft.mentor_ack_timeout_ms / 2U)));
+
+    while (!stop_token.stop_requested()) {
+        std::this_thread::sleep_for(interval);
+        if (stop_token.stop_requested() || !IsLeader()) {
+            continue;
+        }
+
+        if (!lease_->IsValid()) {
+            RequestImmediateHeartbeat();
+        }
+
+        CheckMentorTimeouts();
+        CheckFollowerTimeouts();
+
+        {
+            std::unique_lock progress_lock(peer_progress_mutex_);
+            const auto now = std::chrono::steady_clock::now();
+            for (auto& [_, progress] : peer_progress_) {
+                if (progress.effective_window_size != config_.raft.pipeline_window_size &&
+                    progress.recover_deadline <= now) {
+                    progress.effective_window_size = config_.raft.pipeline_window_size;
+                    progress.direct_mode = false;
+                    topology_refresh_requested_ = true;
+                }
+            }
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (topology_refresh_requested_ ||
+            now - last_topology_refresh_ >=
+                std::chrono::milliseconds(config_.raft.topology_refresh_interval_ms)) {
+            auto refresh = RebalanceTopology();
+            if (!refresh) {
+                LOG_WARN("TOPOLOGY_REFRESH_FAILED", "leader_id={}, error={}", self_id_,
+                         refresh.error);
+            }
+        }
+    }
+}
+
+size_t RaftNode::QuorumSize() const {
+    return (config_.cluster.peers.size() + 1U) / 2U + 1U;
 }
 
 std::string RaftNode::MetaPath() const {
     return (std::filesystem::path(config_.storage.raft_log_dir) / "meta.bin").string();
 }
 
+std::string RaftNode::ResolvePeerAddress(const std::string& peer_id) const {
+    auto node = topology_->GetNode(peer_id);
+    if (node && !node->addr.empty()) {
+        return node->addr;
+    }
+    return peer_id;
+}
+
 void RaftNode::RegisterConfiguredPeers() {
     topology_->SetSelf(self_id_, self_addr_);
     topology_->RegisterNode(self_id_, self_addr_);
     for (const auto& peer : config_.cluster.peers) {
-        // 当前阶段配置里 peers 仍是地址列表，这里先把它同时视为 peer 唯一键和地址。
-        // 后续若配置升级为显式 node_id/addr 映射，只需要在这里替换注册逻辑。
+        if (peer.empty() || peer == self_id_) {
+            continue;
+        }
+        // 当前配置里 peers 仍是地址列表，因此这里临时把“node_id”和“addr”
+        // 合并为同一个字符串使用。后续若升级为显式映射，只需集中替换此处。
         topology_->RegisterNode(peer, peer);
     }
 }
