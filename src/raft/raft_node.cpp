@@ -2,11 +2,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
+#include <iomanip>
 #include <random>
+#include <sstream>
+#include <system_error>
 #include <utility>
 
 #include "common/logger.hpp"
+#include "storage/snapshot_store.hpp"
 
 namespace {
 
@@ -43,6 +48,25 @@ Result<std::string> ExtractRequestId(const LogEntry& entry) {
     }
 
     return Result<std::string>::Ok({});
+}
+
+std::string BuildSnapshotCreatedAt() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    std::tm utc_time{};
+#if defined(_WIN32)
+    gmtime_s(&utc_time, &now_time);
+#else
+    gmtime_r(&now_time, &utc_time);
+#endif
+
+    std::ostringstream stream;
+    stream << std::put_time(&utc_time, "%Y-%m-%dT%H:%M:%SZ");
+    return stream.str();
+}
+
+std::string DedupSnapshotPath(const StorageConfig& storage) {
+    return (std::filesystem::path(storage.snapshot_dir) / "dedup.bin").string();
 }
 
 } // namespace
@@ -88,6 +112,12 @@ Result<std::shared_ptr<RaftNode>> RaftNode::Create(const Config& config, RaftNod
     auto meta = RaftMeta::Load((std::filesystem::path(config.storage.raft_log_dir) / "meta.bin").string());
     if (!meta) {
         return Result<std::shared_ptr<RaftNode>>::Err(meta.error);
+    }
+
+    SnapshotStore snapshot_store(config.storage.snapshot_dir);
+    auto init_snapshot_store = snapshot_store.Initialize();
+    if (!init_snapshot_store) {
+        return Result<std::shared_ptr<RaftNode>>::Err(init_snapshot_store.error);
     }
 
     auto topology = std::make_unique<TopologyManager>(config.cluster.node_id, options.self_addr);
@@ -248,7 +278,16 @@ Result<std::vector<VectorIndex::SearchResult>> RaftNode::LeaseRead(const float* 
     if (!readable) {
         return Result<std::vector<VectorIndex::SearchResult>>::Err(readable.error);
     }
-    return vector_index_->Search(vec, dim, top_k);
+
+    std::shared_ptr<VectorIndex> vector_index;
+    {
+        std::shared_lock index_lock(vector_index_mutex_);
+        vector_index = vector_index_;
+    }
+    if (!vector_index) {
+        return Result<std::vector<VectorIndex::SearchResult>>::Err("向量索引尚未初始化");
+    }
+    return vector_index->Search(vec, dim, top_k);
 }
 
 Result<raftvdb::proto::AppendEntriesResponse> RaftNode::HandleAppendEntries(
@@ -1145,15 +1184,23 @@ void RaftNode::ApplyCommittedEntries() {
         std::string request_id;
 
         if (entry->type == EntryType::kNormal) {
-            if (entry->cmd_type == CmdType::kUpsert) {
+            std::shared_ptr<VectorIndex> vector_index;
+            {
+                std::shared_lock index_lock(vector_index_mutex_);
+                vector_index = vector_index_;
+            }
+            if (!vector_index) {
+                success = false;
+                error = "向量索引尚未初始化";
+            } else if (entry->cmd_type == CmdType::kUpsert) {
                 auto command = UpsertCmd::Deserialize(entry->payload);
                 if (!command) {
                     success = false;
                     error = command.error;
                 } else {
                     request_id = command->request_id;
-                    auto upsert = vector_index_->Upsert(command->id, command->vector.data(),
-                                                        command->vector.size());
+                    auto upsert = vector_index->Upsert(command->id, command->vector.data(),
+                                                       command->vector.size());
                     success = static_cast<bool>(upsert);
                     if (!success) {
                         error = upsert.error;
@@ -1166,7 +1213,7 @@ void RaftNode::ApplyCommittedEntries() {
                     error = command.error;
                 } else {
                     request_id = command->request_id;
-                    auto deleted = vector_index_->Delete(command->id);
+                    auto deleted = vector_index->Delete(command->id);
                     success = static_cast<bool>(deleted);
                     if (!success) {
                         error = deleted.error;
@@ -1180,11 +1227,130 @@ void RaftNode::ApplyCommittedEntries() {
         }
 
         applied_index_.store(next_index, std::memory_order_release);
-        if (config_.raft.snapshot_threshold > 0 &&
-            next_index % config_.raft.snapshot_threshold == 0) {
-            LOG_INFO("SNAPSHOT_THRESHOLD_REACHED", "node_id={}, applied_index={}", self_id_,
-                     next_index);
-        }
+        MaybeTriggerSnapshot(next_index);
+    }
+}
+
+void RaftNode::MaybeTriggerSnapshot(uint64_t applied_index) {
+    if (config_.raft.snapshot_threshold == 0U) {
+        return;
+    }
+
+    const uint64_t last_snapshot_index = last_snapshot_index_.load(std::memory_order_acquire);
+    if (applied_index <= last_snapshot_index) {
+        return;
+    }
+    if (applied_index - last_snapshot_index <= config_.raft.snapshot_threshold) {
+        return;
+    }
+
+    bool expected = false;
+    if (!snapshot_in_progress_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    LOG_INFO("SNAPSHOT_TRIGGERED", "node_id={}, applied_index={}, last_snapshot_index={}", self_id_,
+             applied_index, last_snapshot_index);
+    LaunchSnapshotTask(applied_index);
+}
+
+void RaftNode::LaunchSnapshotTask(uint64_t snapshot_index) {
+    std::shared_ptr<VectorIndex> vector_index;
+    {
+        std::shared_lock index_lock(vector_index_mutex_);
+        vector_index = vector_index_;
+    }
+    if (!vector_index) {
+        snapshot_in_progress_.store(false, std::memory_order_release);
+        LOG_ERROR("SNAPSHOT_START_FAILED", "node_id={}, index={}, error=向量索引尚未初始化", self_id_,
+                  snapshot_index);
+        return;
+    }
+
+    const auto dedup_table = dedup_table_;
+    const auto storage_config = config_.storage;
+    const auto vector_config = config_.vector;
+    const auto node_id = self_id_;
+    const auto weak_self = weak_from_this();
+
+    try {
+        std::thread([weak_self, vector_index = std::move(vector_index), dedup_table,
+                     storage_config, vector_config, node_id, snapshot_index]() {
+            auto finalize = [&weak_self]() {
+                if (auto self = weak_self.lock()) {
+                    self->snapshot_in_progress_.store(false, std::memory_order_release);
+                }
+            };
+
+            SnapshotStore store(storage_config.snapshot_dir);
+            auto init_store = store.Initialize();
+            if (!init_store) {
+                LOG_ERROR("SNAPSHOT_INIT_FAILED", "node_id={}, index={}, error={}", node_id,
+                          snapshot_index, init_store.error);
+                finalize();
+                return;
+            }
+
+            auto save_snapshot = vector_index->SaveSnapshot(store.TemporarySnapshotPath());
+            if (!save_snapshot) {
+                LOG_ERROR("SNAPSHOT_SAVE_FAILED", "node_id={}, index={}, error={}", node_id,
+                          snapshot_index, save_snapshot.error);
+                finalize();
+                return;
+            }
+
+            auto self = weak_self.lock();
+            if (!self) {
+                return;
+            }
+
+            auto snapshot_term = self->wal_->TermAt(snapshot_index);
+            if (!snapshot_term) {
+                LOG_ERROR("SNAPSHOT_META_FAILED", "node_id={}, index={}, error={}", node_id,
+                          snapshot_index, snapshot_term.error);
+                self->snapshot_in_progress_.store(false, std::memory_order_release);
+                return;
+            }
+
+            SnapshotMeta meta;
+            meta.raft_term = *snapshot_term;
+            meta.raft_index = snapshot_index;
+            meta.dim = vector_config.dim;
+            meta.metric = vector_config.metric;
+            meta.data_type = vector_config.data_type;
+            meta.created_at = BuildSnapshotCreatedAt();
+
+            auto finalize_snapshot = store.FinalizeSnapshot(meta);
+            if (!finalize_snapshot) {
+                LOG_ERROR("SNAPSHOT_COMMIT_FAILED", "node_id={}, index={}, error={}", node_id,
+                          snapshot_index, finalize_snapshot.error);
+                self->snapshot_in_progress_.store(false, std::memory_order_release);
+                return;
+            }
+
+            self->last_snapshot_index_.store(snapshot_index, std::memory_order_release);
+
+            auto truncate = self->wal_->TruncateBefore(snapshot_index);
+            if (!truncate) {
+                LOG_ERROR("SNAPSHOT_TRUNCATE_WAL_FAILED", "node_id={}, index={}, error={}", node_id,
+                          snapshot_index, truncate.error);
+            }
+
+            if (dedup_table) {
+                auto save_dedup = dedup_table->SaveTo(DedupSnapshotPath(storage_config));
+                if (!save_dedup) {
+                    LOG_ERROR("SNAPSHOT_SAVE_DEDUP_FAILED", "node_id={}, index={}, error={}",
+                              node_id, snapshot_index, save_dedup.error);
+                }
+            }
+
+            LOG_INFO("SNAPSHOT_COMPLETED", "node_id={}, index={}", node_id, snapshot_index);
+            self->snapshot_in_progress_.store(false, std::memory_order_release);
+        }).detach();
+    } catch (const std::system_error& error) {
+        snapshot_in_progress_.store(false, std::memory_order_release);
+        LOG_ERROR("SNAPSHOT_THREAD_FAILED", "node_id={}, index={}, error={}", self_id_,
+                  snapshot_index, error.what());
     }
 }
 

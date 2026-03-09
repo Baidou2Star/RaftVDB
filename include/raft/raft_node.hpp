@@ -189,6 +189,8 @@ private:
     // ApplyLoop 与租约读
     // ─────────────────────────────────────────────────────────────
     void ApplyCommittedEntries();
+    void MaybeTriggerSnapshot(uint64_t applied_index);
+    void LaunchSnapshotTask(uint64_t snapshot_index);
     Result<void> EnsureLeaseReadable();
 
     // ─────────────────────────────────────────────────────────────
@@ -229,9 +231,12 @@ private:
     std::chrono::steady_clock::time_point election_deadline_{};
     std::chrono::steady_clock::time_point last_leader_contact_{};
     std::chrono::steady_clock::time_point last_topology_refresh_{};
+    std::atomic<uint64_t> last_snapshot_index_{0};
+    std::atomic<bool> snapshot_in_progress_{false};
 
     mutable std::shared_mutex peer_progress_mutex_;
     std::unordered_map<std::string, PeerProgress> peer_progress_;
+    mutable std::shared_mutex vector_index_mutex_;
 
     // Apply / Replication / Heartbeat 三类后台循环各自有独立唤醒条件，
     // 避免一个条件变量被多种职责混用后难以测试。
