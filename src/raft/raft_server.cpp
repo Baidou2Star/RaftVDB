@@ -6,7 +6,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 namespace {
 
@@ -69,15 +68,7 @@ public:
         grpc::ServerContext*,
         grpc::ServerReader<raftvdb::proto::SnapshotChunk>* reader,
         raftvdb::proto::InstallSnapshotResponse* response) override {
-        // 当前阶段先把整个流聚合为 chunk 列表，再交给上层处理器。
-        // 这样可以保持 RaftNode 侧接口稳定，避免在骨架未完成前直接暴露 gRPC Reader。
-        std::vector<raftvdb::proto::SnapshotChunk> chunks;
-        raftvdb::proto::SnapshotChunk chunk;
-        while (reader->Read(&chunk)) {
-            chunks.push_back(chunk);
-        }
-
-        return CopyResultToResponse(handler_->HandleInstallSnapshot(chunks), response,
+        return CopyResultToResponse(handler_->HandleInstallSnapshot(reader), response,
                                     "HandleInstallSnapshot");
     }
 

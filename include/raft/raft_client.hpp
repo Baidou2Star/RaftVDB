@@ -42,6 +42,8 @@ public:
         std::function<void(Result<raftvdb::proto::AppendEntriesResponse>)>;
     using HeartbeatCallback =
         std::function<void(Result<raftvdb::proto::HeartbeatResponse>)>;
+    using SnapshotChunkProducer =
+        std::function<Result<bool>(raftvdb::proto::SnapshotChunk& chunk)>;
 
     explicit RaftClient(RaftClientOptions options = {});
     ~RaftClient();
@@ -69,6 +71,9 @@ public:
     Result<raftvdb::proto::InstallSnapshotResponse> InstallSnapshot(
         const std::string& peer_addr,
         const std::vector<raftvdb::proto::SnapshotChunk>& chunks) const;
+    Result<raftvdb::proto::InstallSnapshotResponse> InstallSnapshot(
+        const std::string& peer_addr,
+        SnapshotChunkProducer producer) const;
 
     Result<raftvdb::proto::LeaderInfo> GetLeader(const std::string& peer_addr) const;
 

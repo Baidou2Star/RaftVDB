@@ -204,6 +204,12 @@ message SnapshotChunk {
   uint32 dim = 6;
   string metric = 7;
   string data_type = 8;
+
+  // 当前 chunk 所属文件名。
+  // 目前用于在同一条快照流中顺序传输：
+  // 1. snapshot.usearch
+  // 2. dedup.bin
+  string file_name = 9;
 }
 
 message InstallSnapshotResponse {

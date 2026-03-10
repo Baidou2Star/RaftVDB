@@ -5,7 +5,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #include "common/result.hpp"
 #include "raft.grpc.pb.h"
@@ -41,11 +40,11 @@ public:
     virtual Result<raftvdb::proto::HeartbeatResponse> HandleHeartbeat(
         const raftvdb::proto::HeartbeatRequest& request) = 0;
 
-    // 处理快照安装请求。当前阶段由服务端先把整个流读取为 chunk 数组，
-    // 再一次性交给处理器，保持接口简单且不把 gRPC Reader 暴露给业务层。
-    // 等 T-30 落快照安装时，如果需要边读边写文件，可再把内部实现细化为流式适配。
+    // 处理快照安装请求。
+    // T-30 起改为直接把 gRPC 的流式 reader 透传给业务层，
+    // 这样处理器可以边读边落盘，避免大快照先在内存中整包聚合。
     virtual Result<raftvdb::proto::InstallSnapshotResponse> HandleInstallSnapshot(
-        const std::vector<raftvdb::proto::SnapshotChunk>& chunks) = 0;
+        grpc::ServerReader<raftvdb::proto::SnapshotChunk>* reader) = 0;
 
     // 返回当前 Leader 信息。Follower 可以返回自己已知的 leader_addr，
     // Leader 则可直接返回自身地址，供客户端做寻主探测。

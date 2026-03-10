@@ -56,6 +56,13 @@ struct PeerProgress {
     // 用简单滑动平均保存 ACK 延迟样本，供 T-27 的诊断逻辑使用。
     double avg_ack_latency_ms = 0.0;
     uint32_t ack_samples = 0;
+
+    // 日志冲突追赶状态：
+    // 1. rollback_anchor_index 记录本轮回溯的起点
+    // 2. rollback_failures 记录连续回溯失败次数
+    // Leader 会先线性回退，再切换到指数回退。
+    uint64_t rollback_anchor_index = 0;
+    uint32_t rollback_failures = 0;
 };
 
 // 启动 RaftNode 时，允许外部补充一些当前 Config 尚未直接表达的依赖。
@@ -125,7 +132,7 @@ public:
     Result<raftvdb::proto::HeartbeatResponse> HandleHeartbeat(
         const raftvdb::proto::HeartbeatRequest& request) override;
     Result<raftvdb::proto::InstallSnapshotResponse> HandleInstallSnapshot(
-        const std::vector<raftvdb::proto::SnapshotChunk>& chunks) override;
+        grpc::ServerReader<raftvdb::proto::SnapshotChunk>* reader) override;
     Result<raftvdb::proto::LeaderInfo> GetLeaderInfo() const override;
 
     // 基础查询接口。
@@ -174,8 +181,13 @@ private:
     Result<void> MaybeCommit();
     Result<void> ReplicatePeerOnce(const std::string& peer_id);
     Result<void> ForwardToFollower(const raftvdb::proto::AppendEntriesRequest& request);
+    Result<void> SendSnapshotToPeer(const std::string& peer_id);
     Result<raftvdb::proto::TopologyInfo> BuildTopologyForPeer(const std::string& peer_id) const;
     void ResetPeerProgressLocked(uint64_t next_index);
+    void ResetPeerRollbackStateLocked(PeerProgress& progress);
+    void ApplyPeerRollbackStateLocked(PeerProgress& progress,
+                                      uint64_t attempted_next_index,
+                                      uint64_t conflict_index);
     void UpdatePeerAck(const std::string& peer_id,
                        uint64_t match_index,
                        std::chrono::steady_clock::time_point sent_at);
@@ -191,6 +203,7 @@ private:
     void ApplyCommittedEntries();
     void MaybeTriggerSnapshot(uint64_t applied_index);
     void LaunchSnapshotTask(uint64_t snapshot_index);
+    Result<void> ApplyInstalledSnapshot(uint64_t snapshot_index);
     Result<void> EnsureLeaseReadable();
 
     // ─────────────────────────────────────────────────────────────

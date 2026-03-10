@@ -184,6 +184,19 @@ Result<raftvdb::proto::HeartbeatResponse> RaftClient::Heartbeat(
 Result<raftvdb::proto::InstallSnapshotResponse> RaftClient::InstallSnapshot(
     const std::string& peer_addr,
     const std::vector<raftvdb::proto::SnapshotChunk>& chunks) const {
+    std::size_t next_chunk = 0;
+    return InstallSnapshot(peer_addr, [&chunks, &next_chunk](raftvdb::proto::SnapshotChunk& chunk) {
+        if (next_chunk >= chunks.size()) {
+            return Result<bool>::Ok(false);
+        }
+        chunk = chunks[next_chunk++];
+        return Result<bool>::Ok(true);
+    });
+}
+
+Result<raftvdb::proto::InstallSnapshotResponse> RaftClient::InstallSnapshot(
+    const std::string& peer_addr,
+    SnapshotChunkProducer producer) const {
     auto validate = ValidatePeerAddress(peer_addr);
     if (!validate) {
         return Result<raftvdb::proto::InstallSnapshotResponse>::Err(validate.error);
@@ -204,7 +217,22 @@ Result<raftvdb::proto::InstallSnapshotResponse> RaftClient::InstallSnapshot(
             "创建 InstallSnapshot 流式写入器失败");
     }
 
-    for (const auto& chunk : chunks) {
+    while (true) {
+        raftvdb::proto::SnapshotChunk chunk;
+        auto next_chunk = producer(chunk);
+        if (!next_chunk) {
+            writer->WritesDone();
+            grpc::Status status = writer->Finish();
+            if (!status.ok()) {
+                return MakeGrpcErrorResult<raftvdb::proto::InstallSnapshotResponse>(
+                    status, "InstallSnapshot");
+            }
+            return Result<raftvdb::proto::InstallSnapshotResponse>::Err(next_chunk.error);
+        }
+        if (!*next_chunk) {
+            break;
+        }
+
         if (!writer->Write(chunk)) {
             writer->WritesDone();
             grpc::Status status = writer->Finish();

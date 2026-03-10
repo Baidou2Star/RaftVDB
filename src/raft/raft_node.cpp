@@ -4,7 +4,9 @@
 #include <cmath>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <system_error>
@@ -68,6 +70,12 @@ std::string BuildSnapshotCreatedAt() {
 std::string DedupSnapshotPath(const StorageConfig& storage) {
     return (std::filesystem::path(storage.snapshot_dir) / "dedup.bin").string();
 }
+
+std::string TemporaryDedupSnapshotPath(const StorageConfig& storage) {
+    return DedupSnapshotPath(storage) + ".tmp";
+}
+
+constexpr std::size_t kInstallSnapshotChunkBytes = 256U * 1024U;
 
 } // namespace
 
@@ -520,25 +528,177 @@ Result<raftvdb::proto::HeartbeatResponse> RaftNode::HandleHeartbeat(
 }
 
 Result<raftvdb::proto::InstallSnapshotResponse> RaftNode::HandleInstallSnapshot(
-    const std::vector<raftvdb::proto::SnapshotChunk>& chunks) {
+    grpc::ServerReader<raftvdb::proto::SnapshotChunk>* reader) {
     raftvdb::proto::InstallSnapshotResponse response;
     response.set_term(CurrentTerm());
 
-    if (chunks.empty()) {
-        response.set_success(false);
-        return Result<raftvdb::proto::InstallSnapshotResponse>::Ok(std::move(response));
+    if (reader == nullptr) {
+        return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
+            "InstallSnapshot 失败: reader 不能为空");
     }
 
-    const uint64_t incoming_term = chunks.back().raft_term();
-    if (incoming_term > CurrentTerm()) {
-        auto become_follower = BecomeFollower(incoming_term);
-        if (!become_follower) {
-            return Result<raftvdb::proto::InstallSnapshotResponse>::Err(become_follower.error);
+    SnapshotStore store(config_.storage.snapshot_dir);
+    auto init_store = store.Initialize();
+    if (!init_store) {
+        return Result<raftvdb::proto::InstallSnapshotResponse>::Err(init_store.error);
+    }
+
+    const std::string temp_dedup_path = TemporaryDedupSnapshotPath(config_.storage);
+    const auto cleanup_temporary_files = [&]() {
+        std::error_code snapshot_ec;
+        std::error_code dedup_ec;
+        std::filesystem::remove(store.TemporarySnapshotPath(), snapshot_ec);
+        std::filesystem::remove(temp_dedup_path, dedup_ec);
+    };
+
+    raftvdb::proto::SnapshotChunk chunk;
+    SnapshotMeta meta;
+    bool has_chunk = false;
+    bool saw_snapshot_file = false;
+    bool saw_dedup_file = false;
+    bool stream_finished = false;
+    std::string current_file_name;
+    std::ofstream current_output;
+    uint64_t expected_offset = 0;
+
+    while (reader->Read(&chunk)) {
+        if (!has_chunk) {
+            has_chunk = true;
+            const uint64_t incoming_term = chunk.raft_term();
+            if (incoming_term < CurrentTerm()) {
+                response.set_term(CurrentTerm());
+                response.set_success(false);
+                cleanup_temporary_files();
+                return Result<raftvdb::proto::InstallSnapshotResponse>::Ok(std::move(response));
+            }
+
+            if (incoming_term > CurrentTerm() ||
+                state_.load(std::memory_order_acquire) != RaftState::kFollower) {
+                auto become_follower = BecomeFollower(incoming_term);
+                if (!become_follower) {
+                    cleanup_temporary_files();
+                    return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
+                        become_follower.error);
+                }
+            }
+
+            meta.raft_term = chunk.raft_term();
+            meta.raft_index = chunk.raft_index();
+            meta.dim = chunk.dim();
+            meta.metric = chunk.metric();
+            meta.data_type = chunk.data_type();
+            meta.created_at = BuildSnapshotCreatedAt();
+            response.set_term(CurrentTerm());
+        } else if (chunk.raft_term() != meta.raft_term || chunk.raft_index() != meta.raft_index ||
+                   chunk.dim() != meta.dim || chunk.metric() != meta.metric ||
+                   chunk.data_type() != meta.data_type) {
+            cleanup_temporary_files();
+            return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
+                "InstallSnapshot 失败: 快照 chunk 元数据不一致");
         }
+
+        std::string file_name = chunk.file_name();
+        if (file_name.empty()) {
+            file_name = "snapshot.usearch";
+        }
+
+        std::string target_path;
+        if (file_name == "snapshot.usearch") {
+            target_path = store.TemporarySnapshotPath();
+            saw_snapshot_file = true;
+        } else if (file_name == "dedup.bin") {
+            target_path = temp_dedup_path;
+            saw_dedup_file = true;
+        } else {
+            cleanup_temporary_files();
+            return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
+                "InstallSnapshot 失败: 不支持的快照文件 " + file_name);
+        }
+
+        if (current_file_name != file_name) {
+            if (current_output.is_open()) {
+                current_output.close();
+            }
+            if (chunk.offset() != 0) {
+                cleanup_temporary_files();
+                return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
+                    "InstallSnapshot 失败: 新文件的首个 chunk offset 必须为 0");
+            }
+
+            current_output.open(target_path, std::ios::binary | std::ios::trunc);
+            if (!current_output.is_open()) {
+                cleanup_temporary_files();
+                return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
+                    "InstallSnapshot 失败: 打开临时文件失败 " + target_path);
+            }
+            current_file_name = file_name;
+            expected_offset = 0;
+        }
+
+        if (chunk.offset() != expected_offset) {
+            cleanup_temporary_files();
+            return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
+                "InstallSnapshot 失败: chunk offset 不连续");
+        }
+
+        current_output.write(chunk.data().data(), static_cast<std::streamsize>(chunk.data().size()));
+        if (!current_output.good()) {
+            cleanup_temporary_files();
+            return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
+                "InstallSnapshot 失败: 写入临时文件失败");
+        }
+
+        expected_offset += chunk.data().size();
+        stream_finished = chunk.is_last();
+    }
+
+    if (current_output.is_open()) {
+        current_output.close();
+    }
+
+    if (!has_chunk) {
+        response.set_success(false);
+        cleanup_temporary_files();
+        return Result<raftvdb::proto::InstallSnapshotResponse>::Ok(std::move(response));
+    }
+    if (!stream_finished) {
+        cleanup_temporary_files();
+        return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
+            "InstallSnapshot 失败: 快照流在 is_last 前中断");
+    }
+    if (!saw_snapshot_file) {
+        cleanup_temporary_files();
+        return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
+            "InstallSnapshot 失败: 缺少 snapshot.usearch");
+    }
+    if (!saw_dedup_file) {
+        cleanup_temporary_files();
+        return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
+            "InstallSnapshot 失败: 缺少 dedup.bin");
+    }
+
+    auto finalize_snapshot = store.FinalizeSnapshot(meta);
+    if (!finalize_snapshot) {
+        cleanup_temporary_files();
+        return Result<raftvdb::proto::InstallSnapshotResponse>::Err(finalize_snapshot.error);
+    }
+
+    std::error_code dedup_rename_ec;
+    std::filesystem::rename(temp_dedup_path, DedupSnapshotPath(config_.storage), dedup_rename_ec);
+    if (dedup_rename_ec) {
+        std::error_code cleanup_ec;
+        std::filesystem::remove(temp_dedup_path, cleanup_ec);
+        return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
+            "InstallSnapshot 失败: 提交 dedup.bin 失败: " + dedup_rename_ec.message());
+    }
+
+    auto apply_snapshot = ApplyInstalledSnapshot(meta.raft_index);
+    if (!apply_snapshot) {
+        return Result<raftvdb::proto::InstallSnapshotResponse>::Err(apply_snapshot.error);
     }
 
     response.set_term(CurrentTerm());
-    response.set_success(false);
+    response.set_success(true);
     return Result<raftvdb::proto::InstallSnapshotResponse>::Ok(std::move(response));
 }
 
@@ -934,6 +1094,10 @@ Result<void> RaftNode::ReplicatePeerOnce(const std::string& peer_id) {
     if (snapshot.in_flight >= window_size) {
         return Result<void>::Ok();
     }
+    if (last_snapshot_index_.load(std::memory_order_acquire) > 0 &&
+        snapshot.next_index <= last_snapshot_index_.load(std::memory_order_acquire)) {
+        return SendSnapshotToPeer(peer_id);
+    }
 
     auto entries = wal_->ReadFrom(snapshot.next_index, config_.raft.batch_max_entries);
     if (!entries) {
@@ -1010,10 +1174,10 @@ Result<void> RaftNode::ReplicatePeerOnce(const std::string& peer_id) {
                 auto found = self->peer_progress_.find(peer_id);
                 if (found != self->peer_progress_.end()) {
                     found->second.in_flight = 0;
-                    found->second.next_index =
-                        result->conflict_index() == 0 ? request_copy.prev_log_index()
-                                                      : result->conflict_index();
                     found->second.healthy = true;
+                    self->ApplyPeerRollbackStateLocked(found->second,
+                                                       request_copy.prev_log_index() + 1U,
+                                                       result->conflict_index());
                 }
             }
             self->RequestReplication();
@@ -1031,6 +1195,17 @@ Result<void> RaftNode::ForwardToFollower(const raftvdb::proto::AppendEntriesRequ
     auto follower = topology_->GetFollowerOf(self_id_);
     if (!follower || !follower->healthy) {
         return Result<void>::Ok();
+    }
+
+    {
+        std::shared_lock progress_lock(peer_progress_mutex_);
+        auto found = peer_progress_.find(follower->node_id);
+        if (found != peer_progress_.end() &&
+            last_snapshot_index_.load(std::memory_order_acquire) > 0 &&
+            found->second.next_index <= last_snapshot_index_.load(std::memory_order_acquire)) {
+            progress_lock.unlock();
+            return SendSnapshotToPeer(follower->node_id);
+        }
     }
 
     raftvdb::proto::AppendEntriesRequest forwarded = request;
@@ -1065,9 +1240,126 @@ Result<void> RaftNode::ForwardToFollower(const raftvdb::proto::AppendEntriesRequ
     auto& progress = peer_progress_[follower->node_id];
     progress.peer_id = follower->node_id;
     progress.in_flight = 0;
-    progress.next_index = response->conflict_index() == 0 ? progress.next_index
-                                                          : response->conflict_index();
     progress.healthy = true;
+    ApplyPeerRollbackStateLocked(progress, forwarded.prev_log_index() + 1U,
+                                 response->conflict_index());
+    return Result<void>::Ok();
+}
+
+Result<void> RaftNode::SendSnapshotToPeer(const std::string& peer_id) {
+    SnapshotStore store(config_.storage.snapshot_dir);
+    auto meta = store.LoadLatest(config_.vector);
+    if (!meta) {
+        return Result<void>::Err("发送快照失败: " + meta.error);
+    }
+
+    std::ifstream snapshot_input(store.SnapshotPath(), std::ios::binary);
+    if (!snapshot_input.is_open()) {
+        return Result<void>::Err("发送快照失败: 打开 snapshot.usearch 失败");
+    }
+
+    std::ifstream dedup_input(DedupSnapshotPath(config_.storage), std::ios::binary);
+    if (!dedup_input.is_open()) {
+        return Result<void>::Err("发送快照失败: 打开 dedup.bin 失败");
+    }
+
+    struct StreamFile {
+        std::string name;
+        std::ifstream* stream = nullptr;
+    };
+
+    std::vector<StreamFile> files{
+        StreamFile{"snapshot.usearch", &snapshot_input},
+        StreamFile{"dedup.bin", &dedup_input},
+    };
+
+    std::size_t file_index = 0;
+    bool emitted_terminal_chunk = false;
+    auto response = raft_client_->InstallSnapshot(
+        ResolvePeerAddress(peer_id),
+        [&, meta_copy = *meta](raftvdb::proto::SnapshotChunk& chunk) mutable -> Result<bool> {
+            if (emitted_terminal_chunk) {
+                return Result<bool>::Ok(false);
+            }
+
+            while (file_index < files.size()) {
+                auto& file = files[file_index];
+                file.stream->clear();
+                const auto offset = static_cast<uint64_t>(file.stream->tellg() >= 0
+                                                              ? file.stream->tellg()
+                                                              : std::streampos(0));
+
+                std::string buffer(kInstallSnapshotChunkBytes, '\0');
+                file.stream->read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                const auto bytes_read = file.stream->gcount();
+
+                if (bytes_read == 0) {
+                    if (file.stream->eof()) {
+                        if (offset == 0) {
+                            chunk.Clear();
+                            chunk.set_file_name(file.name);
+                            chunk.set_offset(0);
+                            chunk.set_is_last(file_index + 1 == files.size());
+                            chunk.set_raft_term(meta_copy.raft_term);
+                            chunk.set_raft_index(meta_copy.raft_index);
+                            chunk.set_dim(meta_copy.dim);
+                            chunk.set_metric(meta_copy.metric);
+                            chunk.set_data_type(meta_copy.data_type);
+                            if (chunk.is_last()) {
+                                emitted_terminal_chunk = true;
+                            }
+                            ++file_index;
+                            return Result<bool>::Ok(true);
+                        }
+                        ++file_index;
+                        continue;
+                    }
+                    return Result<bool>::Err("发送快照失败: 读取快照文件失败");
+                }
+
+                buffer.resize(static_cast<std::size_t>(bytes_read));
+                chunk.Clear();
+                chunk.set_file_name(file.name);
+                chunk.set_data(buffer);
+                chunk.set_offset(offset);
+                chunk.set_raft_term(meta_copy.raft_term);
+                chunk.set_raft_index(meta_copy.raft_index);
+                chunk.set_dim(meta_copy.dim);
+                chunk.set_metric(meta_copy.metric);
+                chunk.set_data_type(meta_copy.data_type);
+
+                const bool file_finished = file.stream->peek() == std::char_traits<char>::eof();
+                chunk.set_is_last(file_finished && file_index + 1 == files.size());
+                if (chunk.is_last()) {
+                    emitted_terminal_chunk = true;
+                }
+                if (file_finished) {
+                    ++file_index;
+                }
+                return Result<bool>::Ok(true);
+            }
+
+            return Result<bool>::Ok(false);
+        });
+    if (!response) {
+        UpdatePeerFailure(peer_id);
+        return Result<void>::Err(response.error);
+    }
+
+    if (response->term() > CurrentTerm()) {
+        auto become_follower = BecomeFollower(response->term());
+        if (!become_follower) {
+            return become_follower;
+        }
+        return Result<void>::Ok();
+    }
+
+    if (!response->success()) {
+        return Result<void>::Err("发送快照失败: 接收方返回 success=false");
+    }
+
+    const auto sent_at = std::chrono::steady_clock::now();
+    UpdatePeerAck(peer_id, meta->raft_index, sent_at);
     return Result<void>::Ok();
 }
 
@@ -1095,8 +1387,40 @@ void RaftNode::ResetPeerProgressLocked(uint64_t next_index) {
         progress.last_ack_time = now;
         progress.last_send_time = now;
         progress.recover_deadline = now;
+        ResetPeerRollbackStateLocked(progress);
         peer_progress_[peer] = progress;
     }
+}
+
+void RaftNode::ResetPeerRollbackStateLocked(PeerProgress& progress) {
+    progress.rollback_anchor_index = 0;
+    progress.rollback_failures = 0;
+}
+
+void RaftNode::ApplyPeerRollbackStateLocked(PeerProgress& progress,
+                                            uint64_t attempted_next_index,
+                                            uint64_t conflict_index) {
+    const uint32_t linear_threshold =
+        std::max<uint32_t>(1U, config_.raft.pipeline_window_size * 2U);
+
+    if (progress.rollback_anchor_index == 0) {
+        progress.rollback_anchor_index = attempted_next_index;
+    }
+    if (conflict_index != 0 && conflict_index < progress.rollback_anchor_index) {
+        progress.rollback_anchor_index = conflict_index;
+    }
+
+    progress.rollback_failures += 1U;
+    uint64_t retreat = progress.rollback_failures;
+    if (progress.rollback_failures > linear_threshold) {
+        const uint32_t exponential_rounds = progress.rollback_failures - linear_threshold;
+        const uint32_t capped_rounds = std::min<uint32_t>(exponential_rounds - 1U, 20U);
+        retreat = static_cast<uint64_t>(linear_threshold) + (1ULL << capped_rounds);
+    }
+
+    progress.next_index = progress.rollback_anchor_index > retreat
+                              ? progress.rollback_anchor_index - retreat
+                              : 1U;
 }
 
 void RaftNode::UpdatePeerAck(const std::string& peer_id,
@@ -1113,6 +1437,7 @@ void RaftNode::UpdatePeerAck(const std::string& peer_id,
     }
     progress.healthy = true;
     progress.last_ack_time = now;
+    ResetPeerRollbackStateLocked(progress);
 
     const double sample_ms =
         static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(now - sent_at).count());
@@ -1352,6 +1677,37 @@ void RaftNode::LaunchSnapshotTask(uint64_t snapshot_index) {
         LOG_ERROR("SNAPSHOT_THREAD_FAILED", "node_id={}, index={}, error={}", self_id_,
                   snapshot_index, error.what());
     }
+}
+
+Result<void> RaftNode::ApplyInstalledSnapshot(uint64_t snapshot_index) {
+    auto loaded_index =
+        VectorIndex::LoadFromSnapshot(SnapshotStore(config_.storage.snapshot_dir).SnapshotPath(),
+                                      config_.vector);
+    if (!loaded_index) {
+        return Result<void>::Err(loaded_index.error);
+    }
+
+    {
+        std::unique_lock index_lock(vector_index_mutex_);
+        vector_index_ = *loaded_index;
+    }
+
+    auto truncate = wal_->TruncateBefore(snapshot_index + 1U);
+    if (!truncate) {
+        return truncate;
+    }
+
+    applied_index_.store(snapshot_index, std::memory_order_release);
+    commit_index_.store(snapshot_index, std::memory_order_release);
+    last_snapshot_index_.store(snapshot_index, std::memory_order_release);
+
+    auto load_dedup = dedup_table_->LoadFrom(DedupSnapshotPath(config_.storage));
+    if (!load_dedup) {
+        return load_dedup;
+    }
+
+    apply_cv_.notify_all();
+    return Result<void>::Ok();
 }
 
 Result<void> RaftNode::EnsureLeaseReadable() {
