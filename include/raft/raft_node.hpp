@@ -133,6 +133,8 @@ public:
         const raftvdb::proto::HeartbeatRequest& request) override;
     Result<raftvdb::proto::InstallSnapshotResponse> HandleInstallSnapshot(
         grpc::ServerReader<raftvdb::proto::SnapshotChunk>* reader) override;
+    Result<raftvdb::proto::ClientWriteResponse> HandleClientWrite(
+        const raftvdb::proto::ClientWriteRequest& request) override;
     Result<raftvdb::proto::LeaderInfo> GetLeaderInfo() const override;
 
     // 基础查询接口。

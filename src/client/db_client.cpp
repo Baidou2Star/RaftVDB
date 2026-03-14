@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -35,6 +36,16 @@ std::string GenerateClientId() {
     std::ostringstream stream;
     stream << host_name << "-" << static_cast<long long>(::getpid());
     return stream.str();
+}
+
+std::string SerializeFloatVectorBytes(const std::vector<float>& values) {
+    if (values.empty()) {
+        return {};
+    }
+
+    std::string bytes(values.size() * sizeof(float), '\0');
+    std::memcpy(bytes.data(), values.data(), bytes.size());
+    return bytes;
 }
 
 } // namespace
@@ -91,12 +102,84 @@ Result<raftvdb::proto::LeaderInfo> DBClient::GetLeader() {
     return refreshed;
 }
 
-Result<void> DBClient::Upsert(const UpsertRequest&) {
-    return Result<void>::Err("DBClient::Upsert 尚未实现");
+Result<void> DBClient::Upsert(const UpsertRequest& request) {
+    if (request.vector.empty()) {
+        return Result<void>::Err("Upsert 失败: vector 不能为空");
+    }
+
+    // request_id 必须在一次“逻辑写入”内保持稳定。
+    // 否则发生 redirect / 重试时，Leader 侧的 DedupTable 会把每次重试都当成新请求。
+    const std::string request_id = NextRequestId();
+
+    auto result = WithRetry<raftvdb::proto::ClientWriteResponse>(
+        [this, &request, request_id](const std::string& target_addr) {
+            auto stub = GetOrCreateStub(target_addr);
+            if (!stub) {
+                return Result<raftvdb::proto::ClientWriteResponse>::Err(stub.error);
+            }
+
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() +
+                                 std::chrono::milliseconds(config_.retry_max_ms));
+
+            raftvdb::proto::ClientWriteRequest rpc_request;
+            rpc_request.set_cmd_type(1U);
+            rpc_request.set_id(request.id);
+            rpc_request.set_vector(SerializeFloatVectorBytes(request.vector));
+            rpc_request.set_request_id(request_id);
+
+            raftvdb::proto::ClientWriteResponse rpc_response;
+            const grpc::Status status = (*stub)->ClientWrite(&context, rpc_request, &rpc_response);
+            if (!status.ok()) {
+                return Result<raftvdb::proto::ClientWriteResponse>::Err(
+                    "ClientWrite RPC 失败: " + status.error_message());
+            }
+            return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(rpc_response));
+        });
+    if (!result) {
+        return Result<void>::Err(result.error);
+    }
+    if (!result->success()) {
+        return Result<void>::Err(result->error().empty() ? "写入未成功完成" : result->error());
+    }
+    return Result<void>::Ok();
 }
 
-Result<void> DBClient::Delete(const DeleteRequest&) {
-    return Result<void>::Err("DBClient::Delete 尚未实现");
+Result<void> DBClient::Delete(const DeleteRequest& request) {
+    // Delete 与 Upsert 一样，需要把 request_id 固定在逻辑请求粒度，
+    // 这样重试不会破坏幂等语义。
+    const std::string request_id = NextRequestId();
+    auto result = WithRetry<raftvdb::proto::ClientWriteResponse>(
+        [this, &request, request_id](const std::string& target_addr) {
+            auto stub = GetOrCreateStub(target_addr);
+            if (!stub) {
+                return Result<raftvdb::proto::ClientWriteResponse>::Err(stub.error);
+            }
+
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() +
+                                 std::chrono::milliseconds(config_.retry_max_ms));
+
+            raftvdb::proto::ClientWriteRequest rpc_request;
+            rpc_request.set_cmd_type(2U);
+            rpc_request.set_id(request.id);
+            rpc_request.set_request_id(request_id);
+
+            raftvdb::proto::ClientWriteResponse rpc_response;
+            const grpc::Status status = (*stub)->ClientWrite(&context, rpc_request, &rpc_response);
+            if (!status.ok()) {
+                return Result<raftvdb::proto::ClientWriteResponse>::Err(
+                    "ClientWrite RPC 失败: " + status.error_message());
+            }
+            return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(rpc_response));
+        });
+    if (!result) {
+        return Result<void>::Err(result.error);
+    }
+    if (!result->success()) {
+        return Result<void>::Err(result->error().empty() ? "删除未成功完成" : result->error());
+    }
+    return Result<void>::Ok();
 }
 
 Result<std::vector<SearchHit>> DBClient::Search(const SearchRequest&) {

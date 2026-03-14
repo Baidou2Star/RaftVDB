@@ -218,6 +218,38 @@ message InstallSnapshotResponse {
 }
 
 // ─────────────────────────────────────────────────────────────
+// ClientWrite
+// ─────────────────────────────────────────────────────────────
+
+// 客户端写入请求。
+// 当前阶段统一复用一条 RPC 承载 Upsert / Delete，两类请求通过 cmd_type 区分。
+message ClientWriteRequest {
+  // 1 = Upsert, 2 = Delete
+  uint32 cmd_type = 1;
+
+  // 向量主键。
+  uint64 id = 2;
+
+  // Upsert 时携带的 float32 原始字节串；Delete 时为空。
+  bytes vector = 3;
+
+  // 客户端生成的幂等 request_id。
+  string request_id = 4;
+}
+
+message ClientWriteResponse {
+  // true 表示本次写入已经完成到可返回客户端的阶段。
+  bool success = 1;
+
+  // 业务错误信息。若 success=false 且 redirect_to 为空、error 也为空，
+  // 表示当前仍在选举中，客户端应按退避策略重试。
+  string error = 2;
+
+  // 非 Leader 时返回的建议跳转地址。
+  string redirect_to = 3;
+}
+
+// ─────────────────────────────────────────────────────────────
 // RaftService 定义
 // ─────────────────────────────────────────────────────────────
 
@@ -236,4 +268,7 @@ service RaftService {
 
   // 供客户端或工具探测当前 Leader。
   rpc GetLeader(Empty) returns (LeaderInfo);
+
+  // 客户端写入口，由 Leader 接收后转换成内部 Propose。
+  rpc ClientWrite(ClientWriteRequest) returns (ClientWriteResponse);
 }

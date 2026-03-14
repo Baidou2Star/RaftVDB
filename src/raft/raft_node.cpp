@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -76,6 +77,20 @@ std::string TemporaryDedupSnapshotPath(const StorageConfig& storage) {
 }
 
 constexpr std::size_t kInstallSnapshotChunkBytes = 256U * 1024U;
+
+Result<std::vector<float>> ParseFloatVectorBytes(const std::string& bytes) {
+    if (bytes.empty()) {
+        return Result<std::vector<float>>::Ok({});
+    }
+    if (bytes.size() % sizeof(float) != 0U) {
+        return Result<std::vector<float>>::Err("向量字节长度不是 float32 的整数倍");
+    }
+
+    const std::size_t count = bytes.size() / sizeof(float);
+    std::vector<float> values(count, 0.0F);
+    std::memcpy(values.data(), bytes.data(), bytes.size());
+    return Result<std::vector<float>>::Ok(std::move(values));
+}
 
 } // namespace
 
@@ -700,6 +715,113 @@ Result<raftvdb::proto::InstallSnapshotResponse> RaftNode::HandleInstallSnapshot(
     response.set_term(CurrentTerm());
     response.set_success(true);
     return Result<raftvdb::proto::InstallSnapshotResponse>::Ok(std::move(response));
+}
+
+Result<raftvdb::proto::ClientWriteResponse> RaftNode::HandleClientWrite(
+    const raftvdb::proto::ClientWriteRequest& request) {
+    raftvdb::proto::ClientWriteResponse response;
+
+    // 客户端写入口只接受 Leader。
+    // Follower 不直接报 transport error，而是显式返回 redirect_to，
+    // 让 DBClient 能在同一次逻辑调用里做单跳切换。
+    const auto leader_hint = LeaderAddr();
+    if (!IsLeader()) {
+        response.set_success(false);
+        response.set_redirect_to(leader_hint);
+        return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
+    }
+
+    if (request.request_id().empty()) {
+        response.set_success(false);
+        response.set_error("request_id 不能为空");
+        return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
+    }
+
+    DedupEntry dedup_entry;
+    auto dedup_state = dedup_table_->Check(request.request_id(), &dedup_entry);
+    if (dedup_state == DedupTable::CheckResult::kAlreadyCommitted) {
+        response.set_success(dedup_entry.success);
+        response.set_error(dedup_entry.error);
+        return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
+    }
+
+    if (dedup_state == DedupTable::CheckResult::kNotFound) {
+        LogEntry entry;
+        entry.type = EntryType::kNormal;
+
+        if (request.cmd_type() == 1U) {
+            auto vector = ParseFloatVectorBytes(request.vector());
+            if (!vector) {
+                response.set_success(false);
+                response.set_error(vector.error);
+                return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
+            }
+            if (vector->size() != config_.vector.dim) {
+                response.set_success(false);
+                response.set_error("写入向量维度与当前配置不一致");
+                return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
+            }
+
+            UpsertCmd command;
+            command.id = request.id();
+            command.request_id = request.request_id();
+            command.vector = *vector;
+            entry.cmd_type = CmdType::kUpsert;
+            entry.payload = command.Serialize();
+        } else if (request.cmd_type() == 2U) {
+            DeleteCmd command;
+            command.id = request.id();
+            command.request_id = request.request_id();
+            entry.cmd_type = CmdType::kDelete;
+            entry.payload = command.Serialize();
+        } else {
+            response.set_success(false);
+            response.set_error("不支持的 cmd_type");
+            return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
+        }
+
+        auto proposed = Propose(entry);
+        if (!proposed) {
+            response.set_success(false);
+            if (!IsLeader()) {
+                response.set_redirect_to(LeaderAddr());
+            } else {
+                response.set_error(proposed.error);
+            }
+            return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
+        }
+    }
+
+    // 已经写入 WAL 后，不立即把“成功”返回给客户端，而是等待这条请求真正进入
+    // DedupTable 的 committed 状态。这样客户端只会在 apply 完成后看到 success=true，
+    // 后续重复请求也能直接走去重表返回。
+    const auto wait_timeout = std::chrono::milliseconds(
+        std::max<uint32_t>(config_.client.retry_max_ms * 2U, config_.raft.election_timeout_max_ms * 2U));
+    const auto deadline = std::chrono::steady_clock::now() + wait_timeout;
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto current_state = dedup_table_->Check(request.request_id(), &dedup_entry);
+        if (current_state == DedupTable::CheckResult::kAlreadyCommitted) {
+            response.set_success(dedup_entry.success);
+            response.set_error(dedup_entry.error);
+            return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
+        }
+
+        if (!IsLeader()) {
+            response.set_success(false);
+            response.set_redirect_to(LeaderAddr());
+            return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
+        }
+
+        std::unique_lock apply_lock(apply_mutex_);
+        apply_cv_.wait_for(apply_lock, std::chrono::milliseconds(20));
+    }
+
+    response.set_success(false);
+    if (!IsLeader()) {
+        response.set_redirect_to(LeaderAddr());
+    }
+    return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
 }
 
 Result<raftvdb::proto::LeaderInfo> RaftNode::GetLeaderInfo() const {

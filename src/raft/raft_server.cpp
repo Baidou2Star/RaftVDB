@@ -78,6 +78,13 @@ public:
         return CopyResultToResponse(handler_->GetLeaderInfo(), response, "GetLeaderInfo");
     }
 
+    grpc::Status ClientWrite(grpc::ServerContext*,
+                             const raftvdb::proto::ClientWriteRequest* request,
+                             raftvdb::proto::ClientWriteResponse* response) override {
+        return CopyResultToResponse(handler_->HandleClientWrite(*request), response,
+                                    "HandleClientWrite");
+    }
+
 private:
     std::shared_ptr<RaftRpcHandler> handler_;
 };

@@ -46,6 +46,11 @@ public:
     virtual Result<raftvdb::proto::InstallSnapshotResponse> HandleInstallSnapshot(
         grpc::ServerReader<raftvdb::proto::SnapshotChunk>* reader) = 0;
 
+    // 处理客户端写请求。若当前节点不是 Leader，会返回 redirect_to
+    // 让 DBClient 直接单跳切到新的 Leader。
+    virtual Result<raftvdb::proto::ClientWriteResponse> HandleClientWrite(
+        const raftvdb::proto::ClientWriteRequest& request) = 0;
+
     // 返回当前 Leader 信息。Follower 可以返回自己已知的 leader_addr，
     // Leader 则可直接返回自身地址，供客户端做寻主探测。
     virtual Result<raftvdb::proto::LeaderInfo> GetLeaderInfo() const = 0;
