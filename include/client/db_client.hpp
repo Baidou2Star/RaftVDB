@@ -41,11 +41,12 @@ struct SearchHit {
 };
 
 // DBClient 负责客户端侧的寻主、连接复用和自动重试。
-// T-31 先落地：
+// 当前阶段已经落地：
 // 1. Connect() 并发探测 peers
 // 2. leader 地址缓存
 // 3. WithRetry() 的统一重试骨架
 // 4. GetLeader() 的重新探测逻辑
+// 5. ClientWrite / ClientSearch 两条客户端 RPC
 class DBClient {
 public:
     static Result<std::unique_ptr<DBClient>> Connect(const std::vector<std::string>& peers,

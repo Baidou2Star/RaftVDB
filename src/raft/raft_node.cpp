@@ -824,6 +824,57 @@ Result<raftvdb::proto::ClientWriteResponse> RaftNode::HandleClientWrite(
     return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
 }
 
+Result<raftvdb::proto::ClientSearchResponse> RaftNode::HandleClientSearch(
+    const raftvdb::proto::ClientSearchRequest& request) {
+    raftvdb::proto::ClientSearchResponse response;
+
+    // 搜索与写入一样，只接受 Leader 入口。
+    // 这样 DBClient 不需要区分读写的寻主逻辑，统一跟随 redirect_to 即可。
+    const auto leader_hint = LeaderAddr();
+    if (!IsLeader()) {
+        response.set_success(false);
+        response.set_redirect_to(leader_hint);
+        return Result<raftvdb::proto::ClientSearchResponse>::Ok(std::move(response));
+    }
+
+    if (request.top_k() == 0U) {
+        response.set_success(false);
+        response.set_error("top_k 必须大于 0");
+        return Result<raftvdb::proto::ClientSearchResponse>::Ok(std::move(response));
+    }
+
+    auto vector = ParseFloatVectorBytes(request.vector());
+    if (!vector) {
+        response.set_success(false);
+        response.set_error(vector.error);
+        return Result<raftvdb::proto::ClientSearchResponse>::Ok(std::move(response));
+    }
+    if (vector->size() != config_.vector.dim) {
+        response.set_success(false);
+        response.set_error("搜索向量维度与当前配置不一致");
+        return Result<raftvdb::proto::ClientSearchResponse>::Ok(std::move(response));
+    }
+
+    auto searched = LeaseRead(vector->data(), vector->size(), request.top_k());
+    if (!searched) {
+        response.set_success(false);
+        if (!IsLeader()) {
+            response.set_redirect_to(LeaderAddr());
+        } else {
+            response.set_error(searched.error);
+        }
+        return Result<raftvdb::proto::ClientSearchResponse>::Ok(std::move(response));
+    }
+
+    response.set_success(true);
+    for (const auto& hit : *searched) {
+        auto* proto_hit = response.add_hits();
+        proto_hit->set_id(hit.id);
+        proto_hit->set_distance(hit.distance);
+    }
+    return Result<raftvdb::proto::ClientSearchResponse>::Ok(std::move(response));
+}
+
 Result<raftvdb::proto::LeaderInfo> RaftNode::GetLeaderInfo() const {
     raftvdb::proto::LeaderInfo info;
     info.set_term(CurrentTerm());

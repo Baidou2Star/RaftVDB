@@ -85,6 +85,13 @@ public:
                                     "HandleClientWrite");
     }
 
+    grpc::Status ClientSearch(grpc::ServerContext*,
+                              const raftvdb::proto::ClientSearchRequest* request,
+                              raftvdb::proto::ClientSearchResponse* response) override {
+        return CopyResultToResponse(handler_->HandleClientSearch(*request), response,
+                                    "HandleClientSearch");
+    }
+
 private:
     std::shared_ptr<RaftRpcHandler> handler_;
 };

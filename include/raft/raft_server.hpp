@@ -51,6 +51,11 @@ public:
     virtual Result<raftvdb::proto::ClientWriteResponse> HandleClientWrite(
         const raftvdb::proto::ClientWriteRequest& request) = 0;
 
+    // 处理客户端搜索请求。当前实现会走 Leader 本地的租约读路径，
+    // 若节点已降为 Follower，则同样返回 redirect_to 给 DBClient。
+    virtual Result<raftvdb::proto::ClientSearchResponse> HandleClientSearch(
+        const raftvdb::proto::ClientSearchRequest& request) = 0;
+
     // 返回当前 Leader 信息。Follower 可以返回自己已知的 leader_addr，
     // Leader 则可直接返回自身地址，供客户端做寻主探测。
     virtual Result<raftvdb::proto::LeaderInfo> GetLeaderInfo() const = 0;

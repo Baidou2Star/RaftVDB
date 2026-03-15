@@ -182,8 +182,51 @@ Result<void> DBClient::Delete(const DeleteRequest& request) {
     return Result<void>::Ok();
 }
 
-Result<std::vector<SearchHit>> DBClient::Search(const SearchRequest&) {
-    return Result<std::vector<SearchHit>>::Err("DBClient::Search 尚未实现");
+Result<std::vector<SearchHit>> DBClient::Search(const SearchRequest& request) {
+    if (request.vector.empty()) {
+        return Result<std::vector<SearchHit>>::Err("Search 失败: vector 不能为空");
+    }
+    if (request.top_k == 0U) {
+        return Result<std::vector<SearchHit>>::Err("Search 失败: top_k 必须大于 0");
+    }
+
+    auto result = WithRetry<raftvdb::proto::ClientSearchResponse>(
+        [this, &request](const std::string& target_addr) {
+            auto stub = GetOrCreateStub(target_addr);
+            if (!stub) {
+                return Result<raftvdb::proto::ClientSearchResponse>::Err(stub.error);
+            }
+
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() +
+                                 std::chrono::milliseconds(config_.retry_max_ms));
+
+            raftvdb::proto::ClientSearchRequest rpc_request;
+            rpc_request.set_vector(SerializeFloatVectorBytes(request.vector));
+            rpc_request.set_top_k(request.top_k);
+
+            raftvdb::proto::ClientSearchResponse rpc_response;
+            const grpc::Status status = (*stub)->ClientSearch(&context, rpc_request, &rpc_response);
+            if (!status.ok()) {
+                return Result<raftvdb::proto::ClientSearchResponse>::Err(
+                    "ClientSearch RPC 失败: " + status.error_message());
+            }
+            return Result<raftvdb::proto::ClientSearchResponse>::Ok(std::move(rpc_response));
+        });
+    if (!result) {
+        return Result<std::vector<SearchHit>>::Err(result.error);
+    }
+    if (!result->success()) {
+        return Result<std::vector<SearchHit>>::Err(result->error().empty() ? "搜索未成功完成"
+                                                                          : result->error());
+    }
+
+    std::vector<SearchHit> hits;
+    hits.reserve(static_cast<std::size_t>(result->hits_size()));
+    for (const auto& hit : result->hits()) {
+        hits.push_back(SearchHit{.id = hit.id(), .distance = hit.distance()});
+    }
+    return Result<std::vector<SearchHit>>::Ok(std::move(hits));
 }
 
 Result<raftvdb::proto::LeaderInfo> DBClient::ProbeLeaderConcurrently() {

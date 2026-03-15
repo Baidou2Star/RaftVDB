@@ -135,6 +135,8 @@ public:
         grpc::ServerReader<raftvdb::proto::SnapshotChunk>* reader) override;
     Result<raftvdb::proto::ClientWriteResponse> HandleClientWrite(
         const raftvdb::proto::ClientWriteRequest& request) override;
+    Result<raftvdb::proto::ClientSearchResponse> HandleClientSearch(
+        const raftvdb::proto::ClientSearchRequest& request) override;
     Result<raftvdb::proto::LeaderInfo> GetLeaderInfo() const override;
 
     // 基础查询接口。
