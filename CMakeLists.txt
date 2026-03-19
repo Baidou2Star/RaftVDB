@@ -16,6 +16,8 @@ endif()
 
 project(RaftVDB VERSION 0.1.0 LANGUAGES CXX)
 
+option(RAFTVDB_BUILD_INTEGRATION_TESTS "Build integration tests that spawn real node processes" OFF)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -323,4 +325,34 @@ if(BUILD_TESTING)
             raftvdb_raft
     )
     add_test(NAME raftvdb-test-raft-runtime COMMAND raftvdb-test-raft-runtime)
+
+    if(RAFTVDB_BUILD_INTEGRATION_TESTS)
+        add_executable(raftvdb-test-integration-basic-replication
+            tests/integration/test_basic_replication.cpp
+        )
+        target_include_directories(raftvdb-test-integration-basic-replication
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}
+        )
+        target_compile_definitions(raftvdb-test-integration-basic-replication
+            PRIVATE
+                RAFTVDB_NODE_BINARY_PATH="$<TARGET_FILE:raftvdb-node>"
+        )
+        target_link_libraries(raftvdb-test-integration-basic-replication
+            PRIVATE
+                raftvdb_common
+                raftvdb_raft
+                raftvdb_storage
+                raftvdb_vector
+                raftvdb_proto
+                Boost::system
+        )
+        add_test(NAME raftvdb-test-integration-basic-replication
+                 COMMAND raftvdb-test-integration-basic-replication)
+        set_tests_properties(raftvdb-test-integration-basic-replication
+            PROPERTIES
+                LABELS integration
+                RUN_SERIAL TRUE
+        )
+    endif()
 endif()
