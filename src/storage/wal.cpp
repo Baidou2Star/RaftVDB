@@ -299,6 +299,7 @@ Result<void> WAL::EnsureActiveSegmentForAppend(uint64_t next_index, size_t recor
 }
 
 Result<void> WAL::Append(const LogEntry& entry) {
+    std::lock_guard lock(mutex_);
     if (!offset_index_.empty() && entry.index != last_index_ + 1) {
         return Result<void>::Err("WAL 追加的日志索引不连续");
     }
@@ -355,6 +356,7 @@ Result<void> WAL::Append(const LogEntry& entry) {
 }
 
 Result<void> WAL::Flush() {
+    std::lock_guard lock(mutex_);
     if (fd_ < 0) {
         return Result<void>::Err("WAL 未打开");
     }
@@ -366,7 +368,7 @@ Result<void> WAL::Flush() {
     return Result<void>::Ok();
 }
 
-Result<LogEntry> WAL::ReadRecordAt(const EntryLocation& location) const {
+Result<LogEntry> WAL::ReadRecordAtUnlocked(const EntryLocation& location) const {
     int fd = -1;
     if (fd_ >= 0 && !segments_.empty() && location.path == segments_.back().path) {
         fd = fd_;
@@ -429,19 +431,25 @@ Result<LogEntry> WAL::ReadRecordAt(const EntryLocation& location) const {
     return LogEntry::Deserialize(payload);
 }
 
-Result<LogEntry> WAL::Read(uint64_t index) {
+Result<LogEntry> WAL::ReadUnlocked(uint64_t index) const {
     const auto found = offset_index_.find(index);
     if (found == offset_index_.end()) {
         return Result<LogEntry>::Err("日志索引不存在: " + std::to_string(index));
     }
-    return ReadRecordAt(found->second);
+    return ReadRecordAtUnlocked(found->second);
+}
+
+Result<LogEntry> WAL::Read(uint64_t index) {
+    std::lock_guard lock(mutex_);
+    return ReadUnlocked(index);
 }
 
 Result<std::vector<LogEntry>> WAL::ReadFrom(uint64_t from_index) {
-    return ReadFrom(from_index, std::numeric_limits<size_t>::max());
+    std::lock_guard lock(mutex_);
+    return ReadFromUnlocked(from_index, std::numeric_limits<size_t>::max());
 }
 
-Result<std::vector<LogEntry>> WAL::ReadFrom(uint64_t from_index, size_t max_entries) {
+Result<std::vector<LogEntry>> WAL::ReadFromUnlocked(uint64_t from_index, size_t max_entries) const {
     std::vector<LogEntry> entries;
     if (max_entries == 0 || offset_index_.empty() || from_index > last_index_) {
         return Result<std::vector<LogEntry>>::Ok(std::move(entries));
@@ -456,7 +464,7 @@ Result<std::vector<LogEntry>> WAL::ReadFrom(uint64_t from_index, size_t max_entr
         if (entries.size() >= max_entries) {
             break;
         }
-        auto entry = ReadRecordAt(it->second);
+        auto entry = ReadRecordAtUnlocked(it->second);
         if (!entry) {
             return Result<std::vector<LogEntry>>::Err(entry.error);
         }
@@ -466,16 +474,26 @@ Result<std::vector<LogEntry>> WAL::ReadFrom(uint64_t from_index, size_t max_entr
     return Result<std::vector<LogEntry>>::Ok(std::move(entries));
 }
 
-Result<uint64_t> WAL::TermAt(uint64_t index) {
+Result<std::vector<LogEntry>> WAL::ReadFrom(uint64_t from_index, size_t max_entries) {
+    std::lock_guard lock(mutex_);
+    return ReadFromUnlocked(from_index, max_entries);
+}
+
+Result<uint64_t> WAL::TermAtUnlocked(uint64_t index) const {
     if (index == 0) {
         return Result<uint64_t>::Ok(0);
     }
 
-    auto entry = Read(index);
+    auto entry = ReadUnlocked(index);
     if (!entry) {
         return Result<uint64_t>::Err(entry.error);
     }
     return Result<uint64_t>::Ok(entry->term);
+}
+
+Result<uint64_t> WAL::TermAt(uint64_t index) {
+    std::lock_guard lock(mutex_);
+    return TermAtUnlocked(index);
 }
 
 Result<void> WAL::RemoveSegmentEntries(const SegmentMeta& segment) {
@@ -618,6 +636,7 @@ Result<void> WAL::RecoverSegment(size_t segment_index, bool* truncated) {
 }
 
 Result<void> WAL::TruncateBefore(uint64_t index) {
+    std::lock_guard lock(mutex_);
     if (segments_.empty()) {
         return Result<void>::Ok();
     }
@@ -677,6 +696,7 @@ Result<void> WAL::TruncateBefore(uint64_t index) {
 }
 
 Result<void> WAL::TruncateSuffix(uint64_t index) {
+    std::lock_guard lock(mutex_);
     if (index == 0) {
         return Result<void>::Err("TruncateSuffix 失败: index 必须从 1 开始");
     }
@@ -780,5 +800,11 @@ Result<void> WAL::TruncateSuffix(uint64_t index) {
 }
 
 Result<void> WAL::Close() {
+    std::lock_guard lock(mutex_);
     return CloseFile(&fd_);
+}
+
+uint64_t WAL::LastIndex() const {
+    std::lock_guard lock(mutex_);
+    return last_index_;
 }

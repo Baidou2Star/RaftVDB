@@ -60,8 +60,10 @@ Result<Config> LoadAndNormalizeConfig(const std::string& config_path) {
 
 Result<std::shared_ptr<VectorIndex>> RestoreVectorIndex(const Config& config,
                                                         const SnapshotStore& snapshot_store,
-                                                        bool* restored_from_snapshot) {
+                                                        bool* restored_from_snapshot,
+                                                        SnapshotMeta* restored_snapshot_meta) {
     *restored_from_snapshot = false;
+    *restored_snapshot_meta = {};
 
     if (!snapshot_store.HasSnapshot()) {
         auto created = VectorIndex::Create(config.vector);
@@ -82,6 +84,7 @@ Result<std::shared_ptr<VectorIndex>> RestoreVectorIndex(const Config& config,
     }
 
     *restored_from_snapshot = true;
+    *restored_snapshot_meta = *meta;
     return loaded;
 }
 
@@ -171,7 +174,9 @@ int main(int argc, char** argv) {
     }
 
     bool restored_from_snapshot = false;
-    auto vector_index = RestoreVectorIndex(*config, snapshot_store, &restored_from_snapshot);
+    SnapshotMeta restored_snapshot_meta;
+    auto vector_index =
+        RestoreVectorIndex(*config, snapshot_store, &restored_from_snapshot, &restored_snapshot_meta);
     if (!vector_index) {
         LOG_ERROR("NODE_BOOTSTRAP_FAILED", "step=restore_vector_index, error={}", vector_index.error);
         return 1;
@@ -193,6 +198,8 @@ int main(int argc, char** argv) {
     options.self_addr = config->cluster.node_id;
     options.vector_index = *vector_index;
     options.dedup_table = *dedup_table;
+    options.restored_snapshot_index = restored_snapshot_meta.raft_index;
+    options.restored_snapshot_term = restored_snapshot_meta.raft_term;
 
     auto node = RaftNode::Create(*config, options);
     if (!node) {

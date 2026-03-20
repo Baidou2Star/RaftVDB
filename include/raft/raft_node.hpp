@@ -20,6 +20,7 @@
 #include "raft/raft_server.hpp"
 #include "raft/topology.hpp"
 #include "storage/raft_meta.hpp"
+#include "storage/snapshot_store.hpp"
 #include "storage/wal.hpp"
 #include "vector/vector_index.hpp"
 
@@ -75,6 +76,12 @@ struct RaftNodeOptions {
     std::shared_ptr<VectorIndex> vector_index;
     std::shared_ptr<DedupTable> dedup_table;
     std::shared_ptr<RaftClient> raft_client;
+
+    // 若启动前已经从 snapshot.meta 恢复了快照元数据，
+    // 需要把 lastSnapshotIndex / lastSnapshotTerm 一并注入 RaftNode。
+    // 否则节点无法正确理解“被快照截断的日志前缀”。
+    uint64_t restored_snapshot_index = 0;
+    uint64_t restored_snapshot_term = 0;
 
     // 是否在 Create() 完成后立刻启动后台线程。
     // 默认关闭，便于单测先把 gRPC Server 拉起，再显式 Start()。
@@ -173,6 +180,8 @@ private:
     Result<void> BroadcastHeartbeat(bool allow_async_callbacks);
     void ResetElectionDeadlineLocked();
     void NoteLeaderContactLocked();
+    uint64_t LogicalLastIndex() const;
+    Result<uint64_t> TermAtLogicalIndex(uint64_t index) const;
     uint64_t LastLogTermLocked();
     bool IsCandidateLogUpToDateLocked(uint64_t candidate_last_log_index,
                                       uint64_t candidate_last_log_term);
@@ -197,7 +206,7 @@ private:
                        std::chrono::steady_clock::time_point sent_at);
     void UpdatePeerHeartbeatAck(const std::string& peer_id,
                                 std::chrono::steady_clock::time_point sent_at);
-    void UpdatePeerFailure(const std::string& peer_id);
+    void UpdatePeerFailure(const std::string& peer_id, uint64_t restore_next_index = 0);
     void RequestReplication();
     void RequestImmediateHeartbeat();
 
@@ -207,7 +216,7 @@ private:
     void ApplyCommittedEntries();
     void MaybeTriggerSnapshot(uint64_t applied_index);
     void LaunchSnapshotTask(uint64_t snapshot_index);
-    Result<void> ApplyInstalledSnapshot(uint64_t snapshot_index);
+    Result<void> ApplyInstalledSnapshot(const SnapshotMeta& snapshot_meta);
     Result<void> EnsureLeaseReadable();
 
     // ─────────────────────────────────────────────────────────────
@@ -249,6 +258,7 @@ private:
     std::chrono::steady_clock::time_point last_leader_contact_{};
     std::chrono::steady_clock::time_point last_topology_refresh_{};
     std::atomic<uint64_t> last_snapshot_index_{0};
+    std::atomic<uint64_t> last_snapshot_term_{0};
     std::atomic<bool> snapshot_in_progress_{false};
 
     mutable std::shared_mutex peer_progress_mutex_;

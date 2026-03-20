@@ -112,6 +112,12 @@ RaftNode::RaftNode(Config config,
       dedup_table_(std::move(options.dedup_table)),
       raft_client_(std::move(options.raft_client)) {
     voted_for_ = meta_.voted_for;
+    last_snapshot_index_.store(options.restored_snapshot_index, std::memory_order_release);
+    last_snapshot_term_.store(options.restored_snapshot_term, std::memory_order_release);
+    if (options.restored_snapshot_index > 0) {
+        applied_index_.store(options.restored_snapshot_index, std::memory_order_release);
+        commit_index_.store(options.restored_snapshot_index, std::memory_order_release);
+    }
     const auto now = std::chrono::steady_clock::now();
     election_deadline_ = now + RandomElectionTimeout(config_.raft);
     last_leader_contact_ = now;
@@ -322,7 +328,7 @@ Result<raftvdb::proto::AppendEntriesResponse> RaftNode::HandleAppendEntries(
     if (request.term() < current_term) {
         response.set_term(current_term);
         response.set_success(false);
-        response.set_conflict_index(wal_->LastIndex() + 1);
+        response.set_conflict_index(LogicalLastIndex() + 1U);
         return Result<raftvdb::proto::AppendEntriesResponse>::Ok(std::move(response));
     }
 
@@ -354,31 +360,47 @@ Result<raftvdb::proto::AppendEntriesResponse> RaftNode::HandleAppendEntries(
     }
 
     const uint64_t prev_log_index = request.prev_log_index();
-    if (prev_log_index > wal_->LastIndex()) {
+    const uint64_t snapshot_index = last_snapshot_index_.load(std::memory_order_acquire);
+    const uint64_t snapshot_term = last_snapshot_term_.load(std::memory_order_acquire);
+    const uint64_t logical_last_index = LogicalLastIndex();
+    if (prev_log_index > logical_last_index) {
         response.set_term(CurrentTerm());
         response.set_success(false);
-        response.set_conflict_index(wal_->LastIndex() + 1);
+        response.set_conflict_index(logical_last_index + 1U);
+        return Result<raftvdb::proto::AppendEntriesResponse>::Ok(std::move(response));
+    }
+
+    if (snapshot_index > 0 && prev_log_index < snapshot_index) {
+        response.set_term(CurrentTerm());
+        response.set_success(false);
+        response.set_conflict_index(snapshot_index + 1U);
+        response.set_conflict_term(snapshot_term);
         return Result<raftvdb::proto::AppendEntriesResponse>::Ok(std::move(response));
     }
 
     if (prev_log_index > 0) {
-        auto prev_entry = wal_->Read(prev_log_index);
-        if (!prev_entry) {
+        auto prev_term = TermAtLogicalIndex(prev_log_index);
+        if (!prev_term) {
             response.set_term(CurrentTerm());
             response.set_success(false);
-            response.set_conflict_index(prev_log_index);
+            response.set_conflict_index(std::max<uint64_t>(snapshot_index + 1U, 1U));
             return Result<raftvdb::proto::AppendEntriesResponse>::Ok(std::move(response));
         }
 
-        if (prev_entry->term != request.prev_log_term()) {
+        if (*prev_term != request.prev_log_term()) {
             response.set_term(CurrentTerm());
             response.set_success(false);
-            response.set_conflict_term(prev_entry->term);
+            response.set_conflict_term(*prev_term);
+
+            if (snapshot_index > 0 && prev_log_index == snapshot_index) {
+                response.set_conflict_index(snapshot_index);
+                return Result<raftvdb::proto::AppendEntriesResponse>::Ok(std::move(response));
+            }
 
             uint64_t conflict_index = prev_log_index;
-            while (conflict_index > 1) {
-                auto previous = wal_->Read(conflict_index - 1);
-                if (!previous || previous->term != prev_entry->term) {
+            while (conflict_index > snapshot_index + 1U) {
+                auto previous = wal_->Read(conflict_index - 1U);
+                if (!previous || previous->term != *prev_term) {
                     break;
                 }
                 --conflict_index;
@@ -396,6 +418,10 @@ Result<raftvdb::proto::AppendEntriesResponse> RaftNode::HandleAppendEntries(
         incoming.type = static_cast<EntryType>(request.entries(index).type());
         incoming.cmd_type = static_cast<CmdType>(request.entries(index).cmd_type());
         incoming.payload = request.entries(index).payload();
+
+        if (snapshot_index > 0 && incoming.index <= snapshot_index) {
+            continue;
+        }
 
         auto existing = wal_->Read(incoming.index);
         if (existing) {
@@ -423,9 +449,11 @@ Result<raftvdb::proto::AppendEntriesResponse> RaftNode::HandleAppendEntries(
         }
     }
 
-    const uint64_t bounded_commit = std::min<uint64_t>(request.leader_commit(), wal_->LastIndex());
-    const uint64_t previous_commit = commit_index_.exchange(bounded_commit, std::memory_order_acq_rel);
+    const uint64_t bounded_commit =
+        std::min<uint64_t>(request.leader_commit(), LogicalLastIndex());
+    const uint64_t previous_commit = commit_index_.load(std::memory_order_acquire);
     if (bounded_commit > previous_commit) {
+        commit_index_.store(bounded_commit, std::memory_order_release);
         apply_cv_.notify_all();
     }
 
@@ -445,7 +473,7 @@ Result<raftvdb::proto::AppendEntriesResponse> RaftNode::HandleAppendEntries(
 
     response.set_term(CurrentTerm());
     response.set_success(true);
-    response.set_match_index(wal_->LastIndex());
+    response.set_match_index(LogicalLastIndex());
     return Result<raftvdb::proto::AppendEntriesResponse>::Ok(std::move(response));
 }
 
@@ -531,9 +559,11 @@ Result<raftvdb::proto::HeartbeatResponse> RaftNode::HandleHeartbeat(
         }
     }
 
-    const uint64_t bounded_commit = std::min<uint64_t>(request.commit_index(), wal_->LastIndex());
-    const uint64_t previous_commit = commit_index_.exchange(bounded_commit, std::memory_order_acq_rel);
+    const uint64_t bounded_commit =
+        std::min<uint64_t>(request.commit_index(), LogicalLastIndex());
+    const uint64_t previous_commit = commit_index_.load(std::memory_order_acquire);
     if (bounded_commit > previous_commit) {
+        commit_index_.store(bounded_commit, std::memory_order_release);
         apply_cv_.notify_all();
     }
 
@@ -603,6 +633,8 @@ Result<raftvdb::proto::InstallSnapshotResponse> RaftNode::HandleInstallSnapshot(
             meta.metric = chunk.metric();
             meta.data_type = chunk.data_type();
             meta.created_at = BuildSnapshotCreatedAt();
+            LOG_INFO("INSTALL_SNAPSHOT_BEGIN", "node_id={}, index={}, term={}", self_id_,
+                     meta.raft_index, meta.raft_term);
             response.set_term(CurrentTerm());
         } else if (chunk.raft_term() != meta.raft_term || chunk.raft_index() != meta.raft_index ||
                    chunk.dim() != meta.dim || chunk.metric() != meta.metric ||
@@ -707,13 +739,15 @@ Result<raftvdb::proto::InstallSnapshotResponse> RaftNode::HandleInstallSnapshot(
             "InstallSnapshot 失败: 提交 dedup.bin 失败: " + dedup_rename_ec.message());
     }
 
-    auto apply_snapshot = ApplyInstalledSnapshot(meta.raft_index);
+    auto apply_snapshot = ApplyInstalledSnapshot(meta);
     if (!apply_snapshot) {
         return Result<raftvdb::proto::InstallSnapshotResponse>::Err(apply_snapshot.error);
     }
 
     response.set_term(CurrentTerm());
     response.set_success(true);
+    LOG_INFO("INSTALL_SNAPSHOT_COMPLETED", "node_id={}, index={}, term={}", self_id_,
+             meta.raft_index, meta.raft_term);
     return Result<raftvdb::proto::InstallSnapshotResponse>::Ok(std::move(response));
 }
 
@@ -1041,7 +1075,7 @@ Result<void> RaftNode::StartElection() {
     raftvdb::proto::RequestVoteRequest request;
     request.set_term(CurrentTerm());
     request.set_candidate_id(self_id_);
-    request.set_last_log_index(wal_->LastIndex());
+    request.set_last_log_index(LogicalLastIndex());
     {
         std::lock_guard state_lock(state_mutex_);
         request.set_last_log_term(LastLogTermLocked());
@@ -1159,12 +1193,37 @@ void RaftNode::NoteLeaderContactLocked() {
     ResetElectionDeadlineLocked();
 }
 
+uint64_t RaftNode::LogicalLastIndex() const {
+    return std::max(last_snapshot_index_.load(std::memory_order_acquire), wal_->LastIndex());
+}
+
+Result<uint64_t> RaftNode::TermAtLogicalIndex(uint64_t index) const {
+    if (index == 0) {
+        return Result<uint64_t>::Ok(0);
+    }
+
+    const uint64_t snapshot_index = last_snapshot_index_.load(std::memory_order_acquire);
+    const uint64_t snapshot_term = last_snapshot_term_.load(std::memory_order_acquire);
+    if (snapshot_index > 0 && index < snapshot_index) {
+        return Result<uint64_t>::Err("日志索引已被快照截断: " + std::to_string(index));
+    }
+    if (snapshot_index > 0 && index == snapshot_index && snapshot_term != 0) {
+        return Result<uint64_t>::Ok(snapshot_term);
+    }
+
+    auto term = wal_->TermAt(index);
+    if (!term) {
+        return Result<uint64_t>::Err(term.error);
+    }
+    return term;
+}
+
 uint64_t RaftNode::LastLogTermLocked() {
-    const uint64_t last_index = wal_->LastIndex();
+    const uint64_t last_index = LogicalLastIndex();
     if (last_index == 0) {
         return 0;
     }
-    auto term = wal_->TermAt(last_index);
+    auto term = TermAtLogicalIndex(last_index);
     if (!term) {
         return 0;
     }
@@ -1174,7 +1233,7 @@ uint64_t RaftNode::LastLogTermLocked() {
 bool RaftNode::IsCandidateLogUpToDateLocked(uint64_t candidate_last_log_index,
                                             uint64_t candidate_last_log_term) {
     const uint64_t local_last_log_term = LastLogTermLocked();
-    const uint64_t local_last_log_index = wal_->LastIndex();
+    const uint64_t local_last_log_index = LogicalLastIndex();
     if (candidate_last_log_term != local_last_log_term) {
         return candidate_last_log_term > local_last_log_term;
     }
@@ -1183,7 +1242,7 @@ bool RaftNode::IsCandidateLogUpToDateLocked(uint64_t candidate_last_log_index,
 
 Result<uint64_t> RaftNode::AppendEntryLocked(const LogEntry& entry) {
     LogEntry next = entry;
-    next.index = wal_->LastIndex() + 1;
+    next.index = LogicalLastIndex() + 1U;
     next.term = current_term_.load(std::memory_order_acquire);
 
     auto append = wal_->Append(next);
@@ -1210,10 +1269,10 @@ Result<void> RaftNode::MaybeCommit() {
         return Result<void>::Ok();
     }
 
-    const uint64_t last_index = wal_->LastIndex();
+    const uint64_t last_index = LogicalLastIndex();
     uint64_t new_commit = commit_index_.load(std::memory_order_acquire);
     for (uint64_t candidate = last_index; candidate > new_commit; --candidate) {
-        auto term = wal_->TermAt(candidate);
+        auto term = TermAtLogicalIndex(candidate);
         if (!term) {
             return Result<void>::Err(term.error);
         }
@@ -1272,11 +1331,15 @@ Result<void> RaftNode::ReplicatePeerOnce(const std::string& peer_id) {
         return SendSnapshotToPeer(peer_id);
     }
 
+    const uint64_t logical_last_index = LogicalLastIndex();
     auto entries = wal_->ReadFrom(snapshot.next_index, config_.raft.batch_max_entries);
     if (!entries) {
         return Result<void>::Err(entries.error);
     }
-    if (entries->empty()) {
+    // 新 Leader 上任后，所有 peer 的 next_index 都会先被保守初始化到“本地尾部 + 1”。
+    // 若此时某个节点其实是落后的，必须发送一条空 AppendEntries 作为探测包，
+    // 让对端返回 conflict_index，才能继续回退到日志或快照路径。
+    if (entries->empty() && snapshot.match_index >= logical_last_index) {
         return Result<void>::Ok();
     }
 
@@ -1284,7 +1347,7 @@ Result<void> RaftNode::ReplicatePeerOnce(const std::string& peer_id) {
     request.set_term(CurrentTerm());
     request.set_leader_id(self_id_);
     request.set_prev_log_index(snapshot.next_index - 1);
-    auto prev_term = wal_->TermAt(snapshot.next_index - 1);
+    auto prev_term = TermAtLogicalIndex(snapshot.next_index - 1U);
     if (!prev_term) {
         return Result<void>::Err(prev_term.error);
     }
@@ -1324,7 +1387,7 @@ Result<void> RaftNode::ReplicatePeerOnce(const std::string& peer_id) {
                 return;
             }
             if (!result) {
-                self->UpdatePeerFailure(peer_id);
+                self->UpdatePeerFailure(peer_id, request_copy.prev_log_index() + 1U);
                 self->RequestReplication();
                 return;
             }
@@ -1357,7 +1420,7 @@ Result<void> RaftNode::ReplicatePeerOnce(const std::string& peer_id) {
         });
 
     if (!async_result) {
-        UpdatePeerFailure(peer_id);
+        UpdatePeerFailure(peer_id, request.prev_log_index() + 1U);
         return Result<void>::Err(async_result.error);
     }
 
@@ -1600,6 +1663,7 @@ void RaftNode::UpdatePeerAck(const std::string& peer_id,
                              uint64_t match_index,
                              std::chrono::steady_clock::time_point sent_at) {
     const auto now = std::chrono::steady_clock::now();
+    topology_->MarkHealthy(peer_id);
     std::unique_lock progress_lock(peer_progress_mutex_);
     auto& progress = peer_progress_[peer_id];
     progress.peer_id = peer_id;
@@ -1618,7 +1682,7 @@ void RaftNode::UpdatePeerAck(const std::string& peer_id,
         ((progress.avg_ack_latency_ms * static_cast<double>(progress.ack_samples)) + sample_ms) /
         static_cast<double>(progress.ack_samples + 1U);
     progress.ack_samples += 1;
-    if (match_index >= wal_->LastIndex() &&
+    if (match_index >= LogicalLastIndex() &&
         (progress.direct_mode ||
          progress.effective_window_size != config_.raft.pipeline_window_size)) {
         topology_refresh_requested_ = true;
@@ -1628,6 +1692,7 @@ void RaftNode::UpdatePeerAck(const std::string& peer_id,
 void RaftNode::UpdatePeerHeartbeatAck(const std::string& peer_id,
                                       std::chrono::steady_clock::time_point sent_at) {
     const auto now = std::chrono::steady_clock::now();
+    topology_->MarkHealthy(peer_id);
     std::unique_lock progress_lock(peer_progress_mutex_);
     auto& progress = peer_progress_[peer_id];
     progress.peer_id = peer_id;
@@ -1642,12 +1707,15 @@ void RaftNode::UpdatePeerHeartbeatAck(const std::string& peer_id,
     progress.ack_samples += 1;
 }
 
-void RaftNode::UpdatePeerFailure(const std::string& peer_id) {
+void RaftNode::UpdatePeerFailure(const std::string& peer_id, uint64_t restore_next_index) {
     std::unique_lock progress_lock(peer_progress_mutex_);
     auto& progress = peer_progress_[peer_id];
     progress.peer_id = peer_id;
     if (progress.in_flight > 0) {
         progress.in_flight -= 1;
+    }
+    if (restore_next_index > 0) {
+        progress.next_index = std::min(progress.next_index, restore_next_index);
     }
 }
 
@@ -1827,6 +1895,7 @@ void RaftNode::LaunchSnapshotTask(uint64_t snapshot_index) {
             }
 
             self->last_snapshot_index_.store(snapshot_index, std::memory_order_release);
+            self->last_snapshot_term_.store(*snapshot_term, std::memory_order_release);
 
             auto truncate = self->wal_->TruncateBefore(snapshot_index);
             if (!truncate) {
@@ -1852,7 +1921,7 @@ void RaftNode::LaunchSnapshotTask(uint64_t snapshot_index) {
     }
 }
 
-Result<void> RaftNode::ApplyInstalledSnapshot(uint64_t snapshot_index) {
+Result<void> RaftNode::ApplyInstalledSnapshot(const SnapshotMeta& snapshot_meta) {
     auto loaded_index =
         VectorIndex::LoadFromSnapshot(SnapshotStore(config_.storage.snapshot_dir).SnapshotPath(),
                                       config_.vector);
@@ -1865,14 +1934,15 @@ Result<void> RaftNode::ApplyInstalledSnapshot(uint64_t snapshot_index) {
         vector_index_ = *loaded_index;
     }
 
-    auto truncate = wal_->TruncateBefore(snapshot_index + 1U);
+    auto truncate = wal_->TruncateBefore(snapshot_meta.raft_index + 1U);
     if (!truncate) {
         return truncate;
     }
 
-    applied_index_.store(snapshot_index, std::memory_order_release);
-    commit_index_.store(snapshot_index, std::memory_order_release);
-    last_snapshot_index_.store(snapshot_index, std::memory_order_release);
+    applied_index_.store(snapshot_meta.raft_index, std::memory_order_release);
+    commit_index_.store(snapshot_meta.raft_index, std::memory_order_release);
+    last_snapshot_index_.store(snapshot_meta.raft_index, std::memory_order_release);
+    last_snapshot_term_.store(snapshot_meta.raft_term, std::memory_order_release);
 
     auto load_dedup = dedup_table_->LoadFrom(DedupSnapshotPath(config_.storage));
     if (!load_dedup) {
@@ -2015,12 +2085,12 @@ void RaftNode::CheckFollowerTimeouts() {
 
         bool follower_ok = false;
         const auto sent_at = std::chrono::steady_clock::now();
-        if (follower_progress.next_index <= wal_->LastIndex()) {
+        if (follower_progress.next_index <= LogicalLastIndex()) {
             raftvdb::proto::AppendEntriesRequest request;
             request.set_term(CurrentTerm());
             request.set_leader_id(self_id_);
             request.set_prev_log_index(follower_progress.next_index - 1);
-            auto prev_term = wal_->TermAt(follower_progress.next_index - 1);
+            auto prev_term = TermAtLogicalIndex(follower_progress.next_index - 1U);
             if (prev_term) {
                 request.set_prev_log_term(*prev_term);
             }
@@ -2086,7 +2156,7 @@ void RaftNode::CheckFollowerTimeouts() {
             if (mentor_it->second.ack_samples < 3 ||
                 mentor_it->second.avg_ack_latency_ms >
                     static_cast<double>(config_.raft.heartbeat_interval_ms * 2U) ||
-                mentor_it->second.match_index + 1 < wal_->LastIndex()) {
+                mentor_it->second.match_index + 1 < LogicalLastIndex()) {
                 mentor_it->second.effective_window_size =
                     std::max<uint32_t>(1U, config_.raft.pipeline_window_size / 2U);
                 mentor_it->second.recover_deadline =

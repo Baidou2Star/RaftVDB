@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,7 +28,7 @@ public:
     Result<uint64_t> TermAt(uint64_t index);
     Result<void> TruncateBefore(uint64_t index);      // 快照后截断整段旧日志
     Result<void> TruncateSuffix(uint64_t index);      // 冲突覆盖时裁掉 index 及之后的尾部日志
-    uint64_t LastIndex() const noexcept { return last_index_; }
+    uint64_t LastIndex() const;
     Result<void> Close();
 
 private:
@@ -54,7 +55,13 @@ private:
     Result<void> RemoveSegmentsAfter(size_t segment_index);
     Result<void> RemoveSegmentEntries(const SegmentMeta& segment);
     Result<void> CreateFreshSegment(uint64_t start_index);
-    Result<LogEntry> ReadRecordAt(const EntryLocation& location) const;
+    // WAL 的公开接口会被复制线程、Apply 线程和快照线程并发调用。
+    // 这些内部辅助函数默认要求调用方已经持有 mutex_，从而保证段元数据、
+    // 活动文件描述符和内存索引始终一致。
+    Result<LogEntry> ReadRecordAtUnlocked(const EntryLocation& location) const;
+    Result<LogEntry> ReadUnlocked(uint64_t index) const;
+    Result<std::vector<LogEntry>> ReadFromUnlocked(uint64_t from_index, size_t max_entries) const;
+    Result<uint64_t> TermAtUnlocked(uint64_t index) const;
 
     int fd_ = -1;
     uint64_t start_ = 0;
@@ -63,4 +70,5 @@ private:
     uint64_t segment_size_bytes_ = kDefaultSegmentSizeBytes;
     std::map<uint64_t, EntryLocation> offset_index_;
     std::vector<SegmentMeta> segments_;
+    mutable std::mutex mutex_;
 };
