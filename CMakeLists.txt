@@ -382,5 +382,33 @@ if(BUILD_TESTING)
                 LABELS integration
                 RUN_SERIAL TRUE
         )
+
+        add_executable(raftvdb-test-integration-chain-replication
+            tests/integration/test_chain_replication.cpp
+        )
+        target_include_directories(raftvdb-test-integration-chain-replication
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}
+        )
+        target_compile_definitions(raftvdb-test-integration-chain-replication
+            PRIVATE
+                RAFTVDB_NODE_BINARY_PATH="$<TARGET_FILE:raftvdb-node>"
+        )
+        target_link_libraries(raftvdb-test-integration-chain-replication
+            PRIVATE
+                raftvdb_common
+                raftvdb_raft
+                raftvdb_storage
+                raftvdb_vector
+                raftvdb_proto
+                Boost::system
+        )
+        add_test(NAME raftvdb-test-integration-chain-replication
+                 COMMAND raftvdb-test-integration-chain-replication)
+        set_tests_properties(raftvdb-test-integration-chain-replication
+            PROPERTIES
+                LABELS integration
+                RUN_SERIAL TRUE
+        )
     endif()
 endif()

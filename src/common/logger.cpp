@@ -64,6 +64,10 @@ std::shared_ptr<spdlog::logger> BuildLogger(
     auto logger = std::make_shared<spdlog::logger>("raftvdb", std::move(sink));
     logger->set_level(level);
     logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%n] %v");
+    // 真实进程集成测试会通过节点日志观察拓扑切换、批量复制和故障恢复路径。
+    // 这里把 info 及以上级别改成即时 flush，避免因为 stdout 重定向到文件后
+    // 出现缓冲延迟，导致测试读不到刚写出的关键信息。
+    logger->flush_on(spdlog::level::info);
     return logger;
 }
 

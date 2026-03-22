@@ -2,12 +2,13 @@
 
 #include <algorithm>
 #include <mutex>
-#include <random>
 #include <shared_mutex>
 #include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include "common/logger.hpp"
 
 namespace {
 
@@ -116,8 +117,9 @@ Result<void> TopologyManager::Rebalance(const std::vector<std::string>& healthy_
         candidates.push_back(node_id);
     }
 
-    std::mt19937 rng(std::random_device{}());
-    std::shuffle(candidates.begin(), candidates.end(), rng);
+    // 定时拓扑刷新会被频繁触发。
+    // 这里保持确定性的节点顺序，避免健康集合不变时也因为随机重排而产生无意义抖动。
+    std::sort(candidates.begin(), candidates.end());
 
     const std::size_t mentor_count = (candidates.size() + 1U) / 2U;
     std::vector<std::string> mentors;
@@ -333,6 +335,19 @@ Result<void> TopologyManager::FromProto(const std::string& node_id,
     }
 
     std::unique_lock lock(mutex_);
+    std::optional<NodeRole> previous_role;
+    std::string previous_source_node_id;
+    std::string previous_follower_node_id;
+    if (auto previous = nodes_.find(node_id); previous != nodes_.end()) {
+        previous_role = previous->second.role;
+        previous_source_node_id = previous->second.source_node_id;
+        if (IsMentorRole(previous->second.role)) {
+            if (auto follower = FindFollowerIdOfLocked(node_id)) {
+                previous_follower_node_id = *follower;
+            }
+        }
+    }
+
     if (!node_addr.empty()) {
         registered_addrs_[node_id] = node_addr;
         if (node_id == self_id_) {
@@ -372,6 +387,27 @@ Result<void> TopologyManager::FromProto(const std::string& node_id,
     }
 
     NormalizeMentorSourcesLocked();
+
+    std::string current_role = RoleToString(node.role);
+    std::string current_source_node_id = node.source_node_id;
+    std::string current_follower_node_id;
+    if (IsMentorRole(node.role)) {
+        if (auto follower = FindFollowerIdOfLocked(node_id)) {
+            current_follower_node_id = *follower;
+        }
+    }
+    const bool topology_changed =
+        !previous_role.has_value() || *previous_role != node.role ||
+        previous_source_node_id != current_source_node_id ||
+        previous_follower_node_id != current_follower_node_id;
+    lock.unlock();
+
+    // 只在角色视图真正变化时打印一次拓扑日志，避免把心跳周期中的相同广播刷满文件。
+    // 集成测试会依赖这条日志识别当前 Mentor / Follower 绑定关系。
+    if (topology_changed) {
+        LOG_INFO("TOPOLOGY_APPLIED", "node_id={}, role={}, source_node_id={}, follower_node_id={}",
+                 node_id, current_role, current_source_node_id, current_follower_node_id);
+    }
     return Result<void>::Ok();
 }
 
