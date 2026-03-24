@@ -410,5 +410,33 @@ if(BUILD_TESTING)
                 LABELS integration
                 RUN_SERIAL TRUE
         )
+
+        add_executable(raftvdb-test-integration-linearizability
+            tests/integration/test_linearizability.cpp
+        )
+        target_include_directories(raftvdb-test-integration-linearizability
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}
+        )
+        target_compile_definitions(raftvdb-test-integration-linearizability
+            PRIVATE
+                RAFTVDB_NODE_BINARY_PATH="$<TARGET_FILE:raftvdb-node>"
+        )
+        target_link_libraries(raftvdb-test-integration-linearizability
+            PRIVATE
+                raftvdb_common
+                raftvdb_raft
+                raftvdb_storage
+                raftvdb_vector
+                raftvdb_proto
+                Boost::system
+        )
+        add_test(NAME raftvdb-test-integration-linearizability
+                 COMMAND raftvdb-test-integration-linearizability)
+        set_tests_properties(raftvdb-test-integration-linearizability
+            PROPERTIES
+                LABELS integration
+                RUN_SERIAL TRUE
+        )
     endif()
 endif()
