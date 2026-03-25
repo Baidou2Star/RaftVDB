@@ -108,6 +108,10 @@ add_library(raftvdb_vector STATIC
     src/vector/vector_index.cpp
     src/vector/index_maintenance.cpp
 )
+target_link_libraries(raftvdb_vector
+    PUBLIC
+        raftvdb_common
+)
 
 add_library(raftvdb_raft STATIC
     src/raft/raft_client.cpp
@@ -434,6 +438,34 @@ if(BUILD_TESTING)
         add_test(NAME raftvdb-test-integration-linearizability
                  COMMAND raftvdb-test-integration-linearizability)
         set_tests_properties(raftvdb-test-integration-linearizability
+            PROPERTIES
+                LABELS integration
+                RUN_SERIAL TRUE
+        )
+
+        add_executable(raftvdb-test-integration-batch-pipeline
+            tests/integration/test_batch_pipeline.cpp
+        )
+        target_include_directories(raftvdb-test-integration-batch-pipeline
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}
+        )
+        target_compile_definitions(raftvdb-test-integration-batch-pipeline
+            PRIVATE
+                RAFTVDB_NODE_BINARY_PATH="$<TARGET_FILE:raftvdb-node>"
+        )
+        target_link_libraries(raftvdb-test-integration-batch-pipeline
+            PRIVATE
+                raftvdb_common
+                raftvdb_raft
+                raftvdb_storage
+                raftvdb_vector
+                raftvdb_proto
+                Boost::system
+        )
+        add_test(NAME raftvdb-test-integration-batch-pipeline
+                 COMMAND raftvdb-test-integration-batch-pipeline)
+        set_tests_properties(raftvdb-test-integration-batch-pipeline
             PROPERTIES
                 LABELS integration
                 RUN_SERIAL TRUE

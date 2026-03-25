@@ -1,6 +1,9 @@
 #include "vector/index_maintenance.hpp"
 
+#include <string>
 #include <utility>
+
+#include "common/logger.hpp"
 
 namespace {
 
@@ -9,6 +12,18 @@ double SafeRatio(size_t numerator, size_t denominator) {
         return 0.0;
     }
     return static_cast<double>(numerator) / static_cast<double>(denominator);
+}
+
+std::string MaintenanceStateName(MaintenanceState state) {
+    switch (state) {
+        case MaintenanceState::kIdle:
+            return "idle";
+        case MaintenanceState::kIsolating:
+            return "isolating";
+        case MaintenanceState::kCompacting:
+            return "compacting";
+    }
+    return "idle";
 }
 
 } // namespace
@@ -50,6 +65,16 @@ void IndexMaintenance::Check(VectorIndex& index) {
     } else {
         return;
     }
+
+    LOG_DEBUG("INDEX_MAINTENANCE_TRIGGER",
+              "state={}, size={}, total_slots={}, deleted={}, delete_ratio={:.3f}, "
+              "fragmentation_ratio={:.3f}",
+              MaintenanceStateName(next_state),
+              size,
+              total_slots,
+              deleted,
+              delete_ratio,
+              fragmentation_ratio);
 
     state_.store(next_state);
     try {
@@ -95,6 +120,16 @@ void IndexMaintenance::RunCompact(VectorIndex& index) {
     auto compacted = index.Compact();
     compact_runs_.fetch_add(1);
 
+    if (compacted) {
+        LOG_INFO("INDEX_COMPACT_COMPLETED",
+                 "size={}, total_slots={}, deleted={}",
+                 index.Size(),
+                 index.TotalSlots(),
+                 index.DeletedCount());
+    } else {
+        LOG_WARN("INDEX_COMPACT_FAILED", "error={}", compacted.error);
+    }
+
     {
         std::lock_guard lock(mutex_);
         if (compacted) {
@@ -109,11 +144,30 @@ void IndexMaintenance::RunIsolate(VectorIndex& index) {
     auto isolated = index.Isolate();
     isolate_runs_.fetch_add(1);
 
+    if (isolated) {
+        LOG_INFO("INDEX_ISOLATE_COMPLETED",
+                 "size={}, total_slots={}, deleted={}",
+                 index.Size(),
+                 index.TotalSlots(),
+                 index.DeletedCount());
+    } else {
+        LOG_WARN("INDEX_ISOLATE_FAILED", "error={}", isolated.error);
+    }
+
     Result<void> compacted = Result<void>::Err("isolate 未成功完成，跳过 compact");
     if (isolated) {
         state_.store(MaintenanceState::kCompacting);
         compacted = index.Compact();
         compact_runs_.fetch_add(1);
+        if (compacted) {
+            LOG_INFO("INDEX_COMPACT_COMPLETED",
+                     "size={}, total_slots={}, deleted={}, source=isolate",
+                     index.Size(),
+                     index.TotalSlots(),
+                     index.DeletedCount());
+        } else {
+            LOG_WARN("INDEX_COMPACT_FAILED", "error={}, source=isolate", compacted.error);
+        }
     }
 
     {

@@ -92,6 +92,18 @@ Result<std::vector<float>> ParseFloatVectorBytes(const std::string& bytes) {
     return Result<std::vector<float>>::Ok(std::move(values));
 }
 
+std::string NodeRoleName(NodeRole role) {
+    switch (role) {
+        case NodeRole::kLeader:
+            return "leader";
+        case NodeRole::kMentor:
+            return "mentor";
+        case NodeRole::kFollower:
+            return "follower";
+    }
+    return "follower";
+}
+
 } // namespace
 
 RaftNode::RaftNode(Config config,
@@ -108,6 +120,7 @@ RaftNode::RaftNode(Config config,
       meta_(std::move(meta)),
       topology_(std::move(topology)),
       lease_(std::move(lease)),
+      index_maintenance_(std::make_unique<IndexMaintenance>(config_.index_maintenance)),
       vector_index_(std::move(options.vector_index)),
       dedup_table_(std::move(options.dedup_table)),
       raft_client_(std::move(options.raft_client)) {
@@ -122,6 +135,7 @@ RaftNode::RaftNode(Config config,
     election_deadline_ = now + RandomElectionTimeout(config_.raft);
     last_leader_contact_ = now;
     last_topology_refresh_ = now;
+    last_index_maintenance_check_ = now;
 }
 
 RaftNode::~RaftNode() {
@@ -1369,13 +1383,29 @@ Result<void> RaftNode::ReplicatePeerOnce(const std::string& peer_id) {
     }
 
     const auto sent_at = std::chrono::steady_clock::now();
+    uint32_t in_flight_after_dispatch = 0;
+    uint64_t optimistic_next_index = snapshot.next_index;
     {
         std::unique_lock progress_lock(peer_progress_mutex_);
         auto& progress = peer_progress_[peer_id];
         progress.in_flight += 1;
         progress.last_send_time = sent_at;
         progress.next_index += static_cast<uint64_t>(entries->size());
+        in_flight_after_dispatch = progress.in_flight;
+        optimistic_next_index = progress.next_index;
     }
+
+    LOG_DEBUG("APPEND_ENTRIES_DISPATCH",
+              "leader_id={}, peer_id={}, prev_log_index={}, entries_count={}, in_flight={}, "
+              "window_size={}, direct_mode={}, next_index={}",
+              self_id_,
+              peer_id,
+              request.prev_log_index(),
+              request.entries_size(),
+              in_flight_after_dispatch,
+              window_size,
+              snapshot.direct_mode,
+              optimistic_next_index);
 
     auto weak_self = weak_from_this();
     const auto request_copy = request;
@@ -2292,16 +2322,30 @@ void RaftNode::ReplicationLoop(std::stop_token stop_token) {
             }
 
             bool should_replicate = node.role == NodeRole::kMentor || node.source_node_id == self_id_;
+            uint32_t current_in_flight = 0;
+            bool direct_mode = false;
             {
                 std::shared_lock progress_lock(peer_progress_mutex_);
                 auto found = peer_progress_.find(node.node_id);
-                if (found != peer_progress_.end() && found->second.direct_mode) {
-                    should_replicate = true;
+                if (found != peer_progress_.end()) {
+                    current_in_flight = found->second.in_flight;
+                    direct_mode = found->second.direct_mode;
+                    if (found->second.direct_mode) {
+                        should_replicate = true;
+                    }
                 }
             }
             if (!should_replicate) {
                 continue;
             }
+
+            LOG_DEBUG("REPLICATION_LOOP_PEER",
+                      "leader_id={}, peer_id={}, role={}, direct_mode={}, in_flight={}",
+                      self_id_,
+                      node.node_id,
+                      NodeRoleName(node.role),
+                      direct_mode,
+                      current_in_flight);
 
             auto replicate = ReplicatePeerOnce(node.node_id);
             if (!replicate) {
@@ -2336,7 +2380,14 @@ void RaftNode::MaintenanceLoop(std::stop_token stop_token) {
 
     while (!stop_token.stop_requested()) {
         std::this_thread::sleep_for(interval);
-        if (stop_token.stop_requested() || !IsLeader()) {
+        if (stop_token.stop_requested()) {
+            continue;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        MaybeRunIndexMaintenance(now);
+
+        if (!IsLeader()) {
             continue;
         }
 
@@ -2360,7 +2411,6 @@ void RaftNode::MaintenanceLoop(std::stop_token stop_token) {
             }
         }
 
-        const auto now = std::chrono::steady_clock::now();
         if (topology_refresh_requested_ ||
             now - last_topology_refresh_ >=
                 std::chrono::milliseconds(config_.raft.topology_refresh_interval_ms)) {
@@ -2371,6 +2421,36 @@ void RaftNode::MaintenanceLoop(std::stop_token stop_token) {
             }
         }
     }
+}
+
+void RaftNode::MaybeRunIndexMaintenance(std::chrono::steady_clock::time_point now) {
+    if (!index_maintenance_ || !vector_index_) {
+        return;
+    }
+
+    const auto check_interval = std::chrono::seconds(config_.index_maintenance.check_interval_s);
+    if (now - last_index_maintenance_check_ < check_interval) {
+        return;
+    }
+    last_index_maintenance_check_ = now;
+
+    std::shared_ptr<VectorIndex> index;
+    {
+        std::shared_lock lock(vector_index_mutex_);
+        index = vector_index_;
+    }
+    if (!index) {
+        return;
+    }
+
+    LOG_DEBUG("INDEX_MAINTENANCE_CHECK",
+              "node_id={}, size={}, total_slots={}, deleted={}, state={}",
+              self_id_,
+              index->Size(),
+              index->TotalSlots(),
+              index->DeletedCount(),
+              static_cast<int>(index_maintenance_->State()));
+    index_maintenance_->Check(*index);
 }
 
 size_t RaftNode::QuorumSize() const {

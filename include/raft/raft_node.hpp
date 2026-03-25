@@ -22,6 +22,7 @@
 #include "storage/raft_meta.hpp"
 #include "storage/snapshot_store.hpp"
 #include "storage/wal.hpp"
+#include "vector/index_maintenance.hpp"
 #include "vector/vector_index.hpp"
 
 // Raft 状态机的三种基础角色。
@@ -218,6 +219,7 @@ private:
     void LaunchSnapshotTask(uint64_t snapshot_index);
     Result<void> ApplyInstalledSnapshot(const SnapshotMeta& snapshot_meta);
     Result<void> EnsureLeaseReadable();
+    void MaybeRunIndexMaintenance(std::chrono::steady_clock::time_point now);
 
     // ─────────────────────────────────────────────────────────────
     // 拓扑与容错
@@ -257,6 +259,7 @@ private:
     std::chrono::steady_clock::time_point election_deadline_{};
     std::chrono::steady_clock::time_point last_leader_contact_{};
     std::chrono::steady_clock::time_point last_topology_refresh_{};
+    std::chrono::steady_clock::time_point last_index_maintenance_check_{};
     std::atomic<uint64_t> last_snapshot_index_{0};
     std::atomic<uint64_t> last_snapshot_term_{0};
     std::atomic<bool> snapshot_in_progress_{false};
@@ -292,6 +295,7 @@ private:
     RaftMeta meta_;
     std::unique_ptr<TopologyManager> topology_;
     std::unique_ptr<LeaseManager> lease_;
+    std::unique_ptr<IndexMaintenance> index_maintenance_;
     std::shared_ptr<VectorIndex> vector_index_;
     std::shared_ptr<DedupTable> dedup_table_;
     std::shared_ptr<RaftClient> raft_client_;
