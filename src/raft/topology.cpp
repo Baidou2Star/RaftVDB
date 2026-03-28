@@ -376,14 +376,24 @@ Result<void> TopologyManager::FromProto(const std::string& node_id,
         }
     }
 
-    // 仅 Mentor 需要恢复自己的下游 Follower 绑定关系。
-    // 这里不广播完整拓扑，只把“我当前负责谁”这条信息带下来即可。
-    if (IsMentorRole(node.role) && !proto.follower_node_id().empty()) {
-        NodeInfo& follower = EnsureNodeLocked(proto.follower_node_id());
-        follower.addr = ResolveAddressLocked(follower.node_id);
-        follower.role = NodeRole::kFollower;
-        follower.source_node_id = node_id;
-        follower.healthy = true;
+    // Mentor 侧收到的 follower_node_id 是“我当前负责谁”的权威描述。
+    // 因此即便该字段为空，也要先把本地缓存里旧的下游绑定清掉，
+    // 避免 Mentor 长时间保留已失效的 follower_node_id。
+    if (IsMentorRole(node.role)) {
+        auto previous_follower = FindFollowerIdOfLocked(node_id);
+        if (previous_follower.has_value() && *previous_follower != proto.follower_node_id()) {
+            NodeInfo& stale_follower = nodes_.at(*previous_follower);
+            stale_follower.role = NodeRole::kFollower;
+            stale_follower.source_node_id.clear();
+        }
+
+        if (!proto.follower_node_id().empty()) {
+            NodeInfo& follower = EnsureNodeLocked(proto.follower_node_id());
+            follower.addr = ResolveAddressLocked(follower.node_id);
+            follower.role = NodeRole::kFollower;
+            follower.source_node_id = node_id;
+            follower.healthy = true;
+        }
     }
 
     NormalizeMentorSourcesLocked();

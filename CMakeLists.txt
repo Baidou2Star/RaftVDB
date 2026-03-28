@@ -498,5 +498,33 @@ if(BUILD_TESTING)
                 LABELS integration
                 RUN_SERIAL TRUE
         )
+
+        add_executable(raftvdb-test-integration-config
+            tests/integration/test_config.cpp
+        )
+        target_include_directories(raftvdb-test-integration-config
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}
+        )
+        target_compile_definitions(raftvdb-test-integration-config
+            PRIVATE
+                RAFTVDB_NODE_BINARY_PATH="$<TARGET_FILE:raftvdb-node>"
+        )
+        target_link_libraries(raftvdb-test-integration-config
+            PRIVATE
+                raftvdb_common
+                raftvdb_raft
+                raftvdb_storage
+                raftvdb_vector
+                raftvdb_proto
+                Boost::system
+        )
+        add_test(NAME raftvdb-test-integration-config
+                 COMMAND raftvdb-test-integration-config)
+        set_tests_properties(raftvdb-test-integration-config
+            PROPERTIES
+                LABELS integration
+                RUN_SERIAL TRUE
+        )
     endif()
 endif()

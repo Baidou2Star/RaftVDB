@@ -2113,6 +2113,11 @@ void RaftNode::CheckFollowerTimeouts() {
             }
         }
 
+        // 这条日志用于观测“配置驱动的 Follower 超时检测”何时触发。
+        // T-41 集成测试会基于它比较不同 mentor_ack_timeout_ms 下的检测时延。
+        LOG_WARN("FOLLOWER_TIMEOUT", "leader_id={}, follower_id={}, mentor_id={}, mentor_recent={}",
+                 self_id_, node.node_id, mentor_id, mentor_recent);
+
         bool follower_ok = false;
         const auto sent_at = std::chrono::steady_clock::now();
         if (follower_progress.next_index <= LogicalLastIndex()) {
@@ -2210,6 +2215,11 @@ void RaftNode::CheckFollowerTimeouts() {
 
         if (mentor_recent) {
             topology_->MarkUnhealthy(node.node_id);
+            LOG_INFO("FOLLOWER_REMOVED_FROM_TOPOLOGY",
+                     "leader_id={}, follower_id={}, mentor_id={}", self_id_, node.node_id,
+                     mentor_id);
+            topology_refresh_requested_ = true;
+            RequestImmediateHeartbeat();
         } else if (HealthyPeerIds().size() + 1U < QuorumSize()) {
             LOG_WARN("CLUSTER_DEGRADED", "leader_id={}, quorum={}, healthy={}", self_id_,
                      QuorumSize(), HealthyPeerIds().size() + 1U);
