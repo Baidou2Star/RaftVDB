@@ -54,14 +54,19 @@ DBClient::DBClient(std::vector<std::string> peers, ClientConfig config, std::str
     : peers_(std::move(peers)), config_(config), client_id_(std::move(client_id)) {}
 
 Result<std::unique_ptr<DBClient>> DBClient::Connect(const std::vector<std::string>& peers,
-                                                    ClientConfig config) {
+                                                    ClientConfig config,
+                                                    std::string client_id_override) {
     auto validate = ValidatePeers(peers);
     if (!validate) {
         return Result<std::unique_ptr<DBClient>>::Err(validate.error);
     }
 
-    auto client =
-        std::unique_ptr<DBClient>(new DBClient(peers, config, GenerateClientId()));
+    if (client_id_override.empty()) {
+        client_id_override = GenerateClientId();
+    }
+
+    auto client = std::unique_ptr<DBClient>(
+        new DBClient(peers, config, std::move(client_id_override)));
     auto leader = client->ProbeLeaderConcurrently();
     if (!leader) {
         return Result<std::unique_ptr<DBClient>>::Err(leader.error);

@@ -50,7 +50,8 @@ struct SearchHit {
 class DBClient {
 public:
     static Result<std::unique_ptr<DBClient>> Connect(const std::vector<std::string>& peers,
-                                                     ClientConfig config = {});
+                                                     ClientConfig config = {},
+                                                     std::string client_id_override = {});
 
     Result<raftvdb::proto::LeaderInfo> GetLeader();
 
