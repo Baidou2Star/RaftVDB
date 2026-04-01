@@ -210,6 +210,11 @@ message SnapshotChunk {
   // 1. snapshot.usearch
   // 2. dedup.bin
   string file_name = 9;
+
+  // 发起 InstallSnapshot 的当前 Leader 任期。
+  // 之所以单独保留该字段，是因为 raft_term 表示“快照内容所属任期”，
+  // 两者在跨任期重复发送同一份快照时可能不同。
+  uint64 leader_term = 10;
 }
 
 message InstallSnapshotResponse {

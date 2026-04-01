@@ -5,6 +5,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -28,13 +30,22 @@ Result<void> ValidatePeers(const std::vector<std::string>& peers) {
 }
 
 std::string GenerateClientId() {
+    static std::atomic<uint64_t> connect_sequence{0};
     char host_name[256] = {};
     if (::gethostname(host_name, sizeof(host_name) - 1) != 0) {
         std::snprintf(host_name, sizeof(host_name), "unknown-host");
     }
 
+    const uint64_t sequence = connect_sequence.fetch_add(1U, std::memory_order_relaxed);
+    const uint64_t time_suffix = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+
     std::ostringstream stream;
-    stream << host_name << "-" << static_cast<long long>(::getpid());
+    // client_id 既要具备“机器/进程可读性”，也要保证同一进程内多次 Connect()
+    // 生成的新 DBClient 彼此唯一；否则 seq 会从 0 重新开始，导致 request_id
+    // 与旧实例撞车，被服务端 DedupTable 误判成重复请求。
+    stream << host_name << "-" << static_cast<long long>(::getpid()) << "-" << time_suffix << "-"
+           << sequence;
     return stream.str();
 }
 
@@ -46,6 +57,15 @@ std::string SerializeFloatVectorBytes(const std::vector<float>& values) {
     std::string bytes(values.size() * sizeof(float), '\0');
     std::memcpy(bytes.data(), values.data(), bytes.size());
     return bytes;
+}
+
+uint64_t ComputeClientRpcTimeoutMs(const ClientConfig& config) {
+    // 服务端写路径会等待日志真正提交并 apply 完成，内部等待窗口可达到
+    // retry_max_ms * 2。客户端若仍只给 retry_max_ms 的 RPC deadline，
+    // 在 Leader 切换、快照追赶或链式复制重平衡时就会先于服务端超时。
+    // 这里统一放宽到 3 倍，并保底 3000ms，让“单次 RPC 的等待时间”
+    // 明显大于“单次逻辑重试的退避上限”。
+    return std::max<uint64_t>(static_cast<uint64_t>(config.retry_max_ms) * 3ULL, 3000ULL);
 }
 
 } // namespace
@@ -125,7 +145,7 @@ Result<void> DBClient::Upsert(const UpsertRequest& request) {
 
             grpc::ClientContext context;
             context.set_deadline(std::chrono::system_clock::now() +
-                                 std::chrono::milliseconds(config_.retry_max_ms));
+                                 std::chrono::milliseconds(ComputeClientRpcTimeoutMs(config_)));
 
             raftvdb::proto::ClientWriteRequest rpc_request;
             rpc_request.set_cmd_type(1U);
@@ -163,7 +183,7 @@ Result<void> DBClient::Delete(const DeleteRequest& request) {
 
             grpc::ClientContext context;
             context.set_deadline(std::chrono::system_clock::now() +
-                                 std::chrono::milliseconds(config_.retry_max_ms));
+                                 std::chrono::milliseconds(ComputeClientRpcTimeoutMs(config_)));
 
             raftvdb::proto::ClientWriteRequest rpc_request;
             rpc_request.set_cmd_type(2U);
@@ -204,7 +224,7 @@ Result<std::vector<SearchHit>> DBClient::Search(const SearchRequest& request) {
 
             grpc::ClientContext context;
             context.set_deadline(std::chrono::system_clock::now() +
-                                 std::chrono::milliseconds(config_.retry_max_ms));
+                                 std::chrono::milliseconds(ComputeClientRpcTimeoutMs(config_)));
 
             raftvdb::proto::ClientSearchRequest rpc_request;
             rpc_request.set_vector(SerializeFloatVectorBytes(request.vector));

@@ -619,21 +619,26 @@ Result<raftvdb::proto::InstallSnapshotResponse> RaftNode::HandleInstallSnapshot(
     std::string current_file_name;
     std::ofstream current_output;
     uint64_t expected_offset = 0;
+    uint64_t stream_leader_term = 0;
 
     while (reader->Read(&chunk)) {
         if (!has_chunk) {
             has_chunk = true;
-            const uint64_t incoming_term = chunk.raft_term();
-            if (incoming_term < CurrentTerm()) {
+            // leader_term 表示“发起本次 InstallSnapshot 的当前 Leader 任期”；
+            // raft_term 则表示“快照内容本身对应的任期”。两者不能混用。
+            const uint64_t incoming_leader_term =
+                chunk.leader_term() == 0 ? chunk.raft_term() : chunk.leader_term();
+            stream_leader_term = incoming_leader_term;
+            if (incoming_leader_term < CurrentTerm()) {
                 response.set_term(CurrentTerm());
                 response.set_success(false);
                 cleanup_temporary_files();
                 return Result<raftvdb::proto::InstallSnapshotResponse>::Ok(std::move(response));
             }
 
-            if (incoming_term > CurrentTerm() ||
+            if (incoming_leader_term > CurrentTerm() ||
                 state_.load(std::memory_order_acquire) != RaftState::kFollower) {
-                auto become_follower = BecomeFollower(incoming_term);
+                auto become_follower = BecomeFollower(incoming_leader_term);
                 if (!become_follower) {
                     cleanup_temporary_files();
                     return Result<raftvdb::proto::InstallSnapshotResponse>::Err(
@@ -650,7 +655,9 @@ Result<raftvdb::proto::InstallSnapshotResponse> RaftNode::HandleInstallSnapshot(
             LOG_INFO("INSTALL_SNAPSHOT_BEGIN", "node_id={}, index={}, term={}", self_id_,
                      meta.raft_index, meta.raft_term);
             response.set_term(CurrentTerm());
-        } else if (chunk.raft_term() != meta.raft_term || chunk.raft_index() != meta.raft_index ||
+        } else if ((chunk.leader_term() == 0 ? chunk.raft_term() : chunk.leader_term()) !=
+                       stream_leader_term ||
+                   chunk.raft_term() != meta.raft_term || chunk.raft_index() != meta.raft_index ||
                    chunk.dim() != meta.dim || chunk.metric() != meta.metric ||
                    chunk.data_type() != meta.data_type) {
             cleanup_temporary_files();
@@ -1441,9 +1448,18 @@ Result<void> RaftNode::ReplicatePeerOnce(const std::string& peer_id) {
                 if (found != self->peer_progress_.end()) {
                     found->second.in_flight = 0;
                     found->second.healthy = true;
-                    self->ApplyPeerRollbackStateLocked(found->second,
-                                                       request_copy.prev_log_index() + 1U,
-                                                       result->conflict_index());
+                    const uint64_t conflict_index = result->conflict_index();
+                    const uint64_t attempted_next_index = request_copy.prev_log_index() + 1U;
+                    if (conflict_index > 0 && conflict_index < attempted_next_index) {
+                        // 对端已经明确告知“从哪条日志开始重发”，
+                        // 这里直接采纳边界，避免把节点重启后的快速对齐误当成连续冲突回退。
+                        found->second.next_index = conflict_index;
+                        self->ResetPeerRollbackStateLocked(found->second);
+                    } else {
+                        self->ApplyPeerRollbackStateLocked(found->second,
+                                                           attempted_next_index,
+                                                           conflict_index);
+                    }
                 }
             }
             self->RequestReplication();
@@ -1507,8 +1523,15 @@ Result<void> RaftNode::ForwardToFollower(const raftvdb::proto::AppendEntriesRequ
     progress.peer_id = follower->node_id;
     progress.in_flight = 0;
     progress.healthy = true;
-    ApplyPeerRollbackStateLocked(progress, forwarded.prev_log_index() + 1U,
-                                 response->conflict_index());
+    const uint64_t conflict_index = response->conflict_index();
+    const uint64_t attempted_next_index = forwarded.prev_log_index() + 1U;
+    if (conflict_index > 0 && conflict_index < attempted_next_index) {
+        // Follower 直接返回一致性边界时，Mentor 也应直接跳转到该位置继续补发。
+        progress.next_index = conflict_index;
+        ResetPeerRollbackStateLocked(progress);
+    } else {
+        ApplyPeerRollbackStateLocked(progress, attempted_next_index, conflict_index);
+    }
     return Result<void>::Ok();
 }
 
@@ -1541,9 +1564,11 @@ Result<void> RaftNode::SendSnapshotToPeer(const std::string& peer_id) {
 
     std::size_t file_index = 0;
     bool emitted_terminal_chunk = false;
+    const uint64_t current_leader_term = CurrentTerm();
     auto response = raft_client_->InstallSnapshot(
         ResolvePeerAddress(peer_id),
-        [&, meta_copy = *meta](raftvdb::proto::SnapshotChunk& chunk) mutable -> Result<bool> {
+        [&, meta_copy = *meta, current_leader_term](raftvdb::proto::SnapshotChunk& chunk) mutable
+            -> Result<bool> {
             if (emitted_terminal_chunk) {
                 return Result<bool>::Ok(false);
             }
@@ -1571,6 +1596,7 @@ Result<void> RaftNode::SendSnapshotToPeer(const std::string& peer_id) {
                             chunk.set_dim(meta_copy.dim);
                             chunk.set_metric(meta_copy.metric);
                             chunk.set_data_type(meta_copy.data_type);
+                            chunk.set_leader_term(current_leader_term);
                             if (chunk.is_last()) {
                                 emitted_terminal_chunk = true;
                             }
@@ -1593,6 +1619,7 @@ Result<void> RaftNode::SendSnapshotToPeer(const std::string& peer_id) {
                 chunk.set_dim(meta_copy.dim);
                 chunk.set_metric(meta_copy.metric);
                 chunk.set_data_type(meta_copy.data_type);
+                chunk.set_leader_term(current_leader_term);
 
                 const bool file_finished = file.stream->peek() == std::char_traits<char>::eof();
                 chunk.set_is_last(file_finished && file_index + 1 == files.size());
@@ -1648,7 +1675,12 @@ void RaftNode::ResetPeerProgressLocked(uint64_t next_index) {
         progress.match_index = 0;
         progress.in_flight = 0;
         progress.healthy = true;
-        progress.direct_mode = false;
+        // 新 Leader 上任后的第一个收敛阶段，先对 Follower 开启临时直发：
+        // 1. 可以尽快拿到真实的 follower match_index，避免“只看到 Mentor ACK”
+        //    导致多数派明明在线却迟迟无法提交；
+        // 2. 等 follower 追平到本地尾部后，UpdatePeerAck/RebalanceTopology()
+        //    会把这类临时直发状态清掉，重新回到链式复制分工。
+        progress.direct_mode = topology_->GetRole(peer) == NodeRole::kFollower;
         progress.effective_window_size = config_.raft.pipeline_window_size;
         progress.last_ack_time = now;
         progress.last_send_time = now;
@@ -2326,6 +2358,7 @@ void RaftNode::ReplicationLoop(std::stop_token stop_token) {
             continue;
         }
 
+        const bool quorum_edge_mode = HealthyPeerIds().size() + 1U <= QuorumSize();
         for (const auto& node : topology_->AllNodes()) {
             if (node.node_id == self_id_ || !node.healthy) {
                 continue;
@@ -2345,16 +2378,24 @@ void RaftNode::ReplicationLoop(std::stop_token stop_token) {
                     }
                 }
             }
+            // 当健康节点总数刚好卡在法定多数边缘时，Leader 必须直接掌握每一个存活副本的
+            // 真实 match_index；否则若仍只依赖 Mentor 链式转发，Follower 的复制进度
+            // 对 Leader 不可见，就可能出现“Leader 存活但永远无法提交新写入”的假活锁。
+            if (quorum_edge_mode && node.role == NodeRole::kFollower) {
+                should_replicate = true;
+            }
             if (!should_replicate) {
                 continue;
             }
 
             LOG_DEBUG("REPLICATION_LOOP_PEER",
-                      "leader_id={}, peer_id={}, role={}, direct_mode={}, in_flight={}",
+                      "leader_id={}, peer_id={}, role={}, direct_mode={}, quorum_edge_mode={}, "
+                      "in_flight={}",
                       self_id_,
                       node.node_id,
                       NodeRoleName(node.role),
                       direct_mode,
+                      quorum_edge_mode,
                       current_in_flight);
 
             auto replicate = ReplicatePeerOnce(node.node_id);
