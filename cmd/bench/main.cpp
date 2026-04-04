@@ -26,8 +26,12 @@ namespace {
 
 using namespace std::chrono_literals;
 
-enum class BenchMode { kUpsert, kSearch, kMixed };
-enum class OperationKind { kUpsert, kSearch };
+enum class BenchMode { kUpsert, kDelete, kSearch, kMixed, kFull };
+enum class OperationKind { kUpsert, kDelete, kSearch };
+
+constexpr uint64_t kDefaultUpsertIdBase = 1U;
+constexpr uint64_t kDeleteModeIdBase = 1000000U;
+constexpr uint64_t kFullModeIdBase = 2000000U;
 
 struct BenchOptions {
     std::vector<std::string> peers;
@@ -53,7 +57,8 @@ struct WorkerContext {
 };
 
 struct SharedCounters {
-    std::atomic<uint64_t> next_vector_id{1};
+    std::atomic<uint64_t> next_vector_id{kDefaultUpsertIdBase};
+    std::atomic<uint64_t> next_delete_id{kDefaultUpsertIdBase};
     std::atomic<uint64_t> visible_upper_bound{0};
     std::atomic<uint64_t> completed{0};
     std::atomic<uint64_t> failures{0};
@@ -98,21 +103,36 @@ std::string BenchModeToString(BenchMode mode) {
     switch (mode) {
     case BenchMode::kUpsert:
         return "upsert";
+    case BenchMode::kDelete:
+        return "delete";
     case BenchMode::kSearch:
         return "search";
     case BenchMode::kMixed:
         return "mixed";
+    case BenchMode::kFull:
+        return "full";
     }
     return "mixed";
 }
 
 std::string OperationKindToString(OperationKind kind) {
-    return kind == OperationKind::kUpsert ? "upsert" : "search";
+    switch (kind) {
+    case OperationKind::kUpsert:
+        return "upsert";
+    case OperationKind::kDelete:
+        return "delete";
+    case OperationKind::kSearch:
+        return "search";
+    }
+    return "search";
 }
 
 Result<BenchMode> ParseMode(std::string_view text) {
     if (text == "upsert") {
         return Result<BenchMode>::Ok(BenchMode::kUpsert);
+    }
+    if (text == "delete") {
+        return Result<BenchMode>::Ok(BenchMode::kDelete);
     }
     if (text == "search") {
         return Result<BenchMode>::Ok(BenchMode::kSearch);
@@ -120,14 +140,17 @@ Result<BenchMode> ParseMode(std::string_view text) {
     if (text == "mixed") {
         return Result<BenchMode>::Ok(BenchMode::kMixed);
     }
-    return Result<BenchMode>::Err("mode 只支持 upsert / search / mixed");
+    if (text == "full") {
+        return Result<BenchMode>::Ok(BenchMode::kFull);
+    }
+    return Result<BenchMode>::Err("mode 只支持 upsert / delete / search / mixed / full");
 }
 
 void PrintUsage(std::ostream& output, const char* program) {
     output << "用法:\n"
            << "  " << program
            << " --peers host1:port,host2:port [--threads 4] [--requests 10000]\n"
-           << "     [--dim 1024] [--mode upsert|search|mixed] [--warmup 1000]\n"
+           << "     [--dim 1024] [--mode upsert|delete|search|mixed|full] [--warmup 1000]\n"
            << "     [--output result.csv]\n\n"
            << "说明:\n"
            << "  --peers    逗号分隔的节点地址列表\n"
@@ -135,7 +158,9 @@ void PrintUsage(std::ostream& output, const char* program) {
            << "  --requests 计入统计的总请求数，默认 10000\n"
            << "  --dim      向量维度，默认 1024\n"
            << "  --mode     压测模式，默认 mixed（70% upsert + 30% search）\n"
-           << "  --warmup   预热请求数，默认 1000；包含 search 的模式会用预热阶段先写入样本\n"
+           << "             delete 会先单线程预填充 requests+warmup 条向量，再统计删除\n"
+           << "             full 为 50% upsert + 20% delete + 30% search\n"
+           << "  --warmup   预热请求数，默认 1000；包含 search/delete 的模式会先准备样本\n"
            << "  --output   可选，输出 CSV 文件路径\n";
 }
 
@@ -261,6 +286,15 @@ std::vector<float> BuildVectorForId(uint64_t id, uint32_t dim) {
     return values;
 }
 
+std::vector<float> BuildRandomVector(std::mt19937_64& rng, uint32_t dim) {
+    std::vector<float> values(dim, 0.0F);
+    std::uniform_real_distribution<float> distribution(0.0F, 1.0F);
+    for (auto& value : values) {
+        value = distribution(rng);
+    }
+    return values;
+}
+
 void UpdateVisibleUpperBound(std::atomic<uint64_t>& current, uint64_t candidate) {
     uint64_t observed = current.load(std::memory_order_acquire);
     while (observed < candidate &&
@@ -273,14 +307,110 @@ OperationKind PickOperation(BenchMode mode, std::mt19937_64& rng) {
     switch (mode) {
     case BenchMode::kUpsert:
         return OperationKind::kUpsert;
+    case BenchMode::kDelete:
+        return OperationKind::kDelete;
     case BenchMode::kSearch:
         return OperationKind::kSearch;
     case BenchMode::kMixed: {
         std::uniform_int_distribution<int> distribution(0, 99);
         return distribution(rng) < 70 ? OperationKind::kUpsert : OperationKind::kSearch;
     }
+    case BenchMode::kFull:
+        break;
     }
     return OperationKind::kSearch;
+}
+
+uint64_t IdBaseForMode(BenchMode mode) {
+    switch (mode) {
+    case BenchMode::kDelete:
+        return kDeleteModeIdBase;
+    case BenchMode::kFull:
+        return kFullModeIdBase;
+    case BenchMode::kUpsert:
+    case BenchMode::kSearch:
+    case BenchMode::kMixed:
+        return kDefaultUpsertIdBase;
+    }
+    return kDefaultUpsertIdBase;
+}
+
+std::string BuildClientId(BenchMode mode, uint32_t thread_index) {
+    switch (mode) {
+    case BenchMode::kDelete:
+        return "bench-thread-" + std::to_string(thread_index) + "-del";
+    case BenchMode::kFull:
+        return "bench-thread-" + std::to_string(thread_index) + "-full";
+    case BenchMode::kUpsert:
+        return "bench-thread-" + std::to_string(thread_index) + "-upsert";
+    case BenchMode::kSearch:
+        return "bench-thread-" + std::to_string(thread_index) + "-search";
+    case BenchMode::kMixed:
+        return "bench-thread-" + std::to_string(thread_index) + "-mixed";
+    }
+    return "bench-thread-" + std::to_string(thread_index);
+}
+
+std::string BuildPrefillClientId(BenchMode mode) {
+    switch (mode) {
+    case BenchMode::kDelete:
+        return "bench-prefill-delete";
+    case BenchMode::kFull:
+        return "bench-prefill-full";
+    case BenchMode::kUpsert:
+    case BenchMode::kSearch:
+    case BenchMode::kMixed:
+        return "bench-prefill-generic";
+    }
+    return "bench-prefill";
+}
+
+OperationKind PickOperation(BenchMode mode, uint64_t request_index, std::mt19937_64& rng) {
+    if (mode == BenchMode::kFull) {
+        // full 模式按固定比例循环：每 10 个请求里前 5 个 upsert、接着 2 个 delete、
+        // 剩余 3 个 search。这样既能稳定复现混合负载，也便于跨轮次比较。
+        const uint64_t slot = request_index % 10U;
+        if (slot < 5U) {
+            return OperationKind::kUpsert;
+        }
+        if (slot < 7U) {
+            return OperationKind::kDelete;
+        }
+        return OperationKind::kSearch;
+    }
+    return PickOperation(mode, rng);
+}
+
+void InitializeCountersForMode(const BenchOptions& options, SharedCounters& counters) {
+    const uint64_t base = IdBaseForMode(options.mode);
+    counters.next_vector_id.store(base, std::memory_order_release);
+    counters.next_delete_id.store(base, std::memory_order_release);
+    counters.visible_upper_bound.store(base == 0U ? 0U : base - 1U, std::memory_order_release);
+    counters.completed.store(0U, std::memory_order_release);
+    counters.failures.store(0U, std::memory_order_release);
+}
+
+Result<void> RunPrefillIfNeeded(const BenchOptions& options, SharedCounters& counters) {
+    if (options.mode != BenchMode::kDelete) {
+        return Result<void>::Ok();
+    }
+
+    auto client = DBClient::Connect(options.peers, ClientConfig{}, BuildPrefillClientId(options.mode));
+    if (!client) {
+        return Result<void>::Err("delete 模式预填充阶段建立客户端失败: " + client.error);
+    }
+
+    const uint64_t total_prefill = options.requests + options.warmup;
+    for (uint64_t index = 0; index < total_prefill; ++index) {
+        const uint64_t vector_id = counters.next_vector_id.fetch_add(1U, std::memory_order_acq_rel);
+        auto result =
+            (*client)->Upsert(UpsertRequest{.id = vector_id, .vector = BuildVectorForId(vector_id, options.dim)});
+        if (!result) {
+            return Result<void>::Err("delete 模式预填充失败: " + result.error);
+        }
+        UpdateVisibleUpperBound(counters.visible_upper_bound, vector_id);
+    }
+    return Result<void>::Ok();
 }
 
 Result<void> EnsureCsvParent(const std::string& output_path) {
@@ -394,8 +524,7 @@ Result<void> RunWarmup(const BenchOptions& options,
 
     for (uint32_t index = 0; index < options.threads; ++index) {
         threads.emplace_back([&, index]() {
-            const std::string client_id =
-                "bench-thread-" + std::to_string(index) + "-" + std::to_string(static_cast<long long>(::getpid()));
+            const std::string client_id = BuildClientId(options.mode, index);
             auto client = DBClient::Connect(options.peers, ClientConfig{}, client_id);
             if (!client) {
                 std::lock_guard lock(error_mutex);
@@ -407,14 +536,24 @@ Result<void> RunWarmup(const BenchOptions& options,
 
             workers[static_cast<std::size_t>(index)].client = std::move(*client);
             for (uint64_t request = 0; request < work[static_cast<std::size_t>(index)]; ++request) {
-                const uint64_t vector_id = counters.next_vector_id.fetch_add(1, std::memory_order_acq_rel);
-                auto result = workers[static_cast<std::size_t>(index)].client->Upsert(
-                    UpsertRequest{.id = vector_id, .vector = BuildVectorForId(vector_id, options.dim)});
+                Result<void> result = Result<void>::Ok();
+                if (options.mode == BenchMode::kDelete) {
+                    const uint64_t vector_id =
+                        counters.next_delete_id.fetch_add(1U, std::memory_order_acq_rel);
+                    result = workers[static_cast<std::size_t>(index)].client->Delete(
+                        DeleteRequest{.id = vector_id});
+                } else {
+                    const uint64_t vector_id =
+                        counters.next_vector_id.fetch_add(1U, std::memory_order_acq_rel);
+                    result = workers[static_cast<std::size_t>(index)].client->Upsert(
+                        UpsertRequest{.id = vector_id, .vector = BuildVectorForId(vector_id, options.dim)});
+                    if (result) {
+                        UpdateVisibleUpperBound(counters.visible_upper_bound, vector_id);
+                    }
+                }
                 if (!result) {
                     ++workers[static_cast<std::size_t>(index)].warmup_errors;
-                    continue;
                 }
-                UpdateVisibleUpperBound(counters.visible_upper_bound, vector_id);
             }
         });
     }
@@ -492,7 +631,7 @@ Result<std::vector<RequestRecord>> RunMeasuredPhase(const BenchOptions& options,
             std::mt19937_64 rng(static_cast<uint64_t>(index + 1U) * 0x9E3779B97F4A7C15ULL);
 
             for (uint64_t request = 0; request < work[static_cast<std::size_t>(index)]; ++request) {
-                const OperationKind operation = PickOperation(options.mode, rng);
+                const OperationKind operation = PickOperation(options.mode, request, rng);
                 const auto wall_start = std::chrono::system_clock::now();
                 const auto steady_start = std::chrono::steady_clock::now();
 
@@ -506,13 +645,23 @@ Result<std::vector<RequestRecord>> RunMeasuredPhase(const BenchOptions& options,
                     if (success) {
                         UpdateVisibleUpperBound(counters.visible_upper_bound, vector_id);
                     }
+                } else if (operation == OperationKind::kDelete) {
+                    const uint64_t vector_id =
+                        counters.next_delete_id.fetch_add(1U, std::memory_order_acq_rel);
+                    auto result = worker.client->Delete(DeleteRequest{.id = vector_id});
+                    success = static_cast<bool>(result);
                 } else {
                     const uint64_t visible = counters.visible_upper_bound.load(std::memory_order_acquire);
-                    const uint64_t target_id = visible == 0U
-                                                   ? 1U
-                                                   : std::uniform_int_distribution<uint64_t>(1U, visible)(rng);
+                    const uint64_t base = IdBaseForMode(options.mode);
+                    const uint64_t range_begin = base;
+                    const uint64_t range_end = visible < range_begin ? range_begin : visible;
+                    const uint64_t target_id =
+                        std::uniform_int_distribution<uint64_t>(range_begin, range_end)(rng);
+                    const std::vector<float> query_vector =
+                        options.mode == BenchMode::kFull ? BuildRandomVector(rng, options.dim)
+                                                         : BuildVectorForId(target_id, options.dim);
                     auto result = worker.client->Search(
-                        SearchRequest{.vector = BuildVectorForId(target_id, options.dim), .top_k = 10U});
+                        SearchRequest{.vector = std::move(query_vector), .top_k = 10U});
                     success = static_cast<bool>(result);
                 }
 
@@ -569,9 +718,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if ((options->mode == BenchMode::kSearch || options->mode == BenchMode::kMixed) &&
+    if ((options->mode == BenchMode::kSearch || options->mode == BenchMode::kMixed ||
+         options->mode == BenchMode::kDelete || options->mode == BenchMode::kFull) &&
         options->warmup == 0U) {
-        std::cerr << "警告: 当前模式包含 Search，但 warmup=0；前几次查询可能落在空索引上。\n";
+        std::cerr << "警告: 当前模式包含 Search/Delete，但 warmup=0；前几次操作可能命中空样本集。\n";
     }
 
     std::cout << "bench 配置:"
@@ -589,7 +739,14 @@ int main(int argc, char** argv) {
               << " warmup=" << options->warmup << '\n';
 
     SharedCounters counters;
+    InitializeCountersForMode(*options, counters);
     std::vector<WorkerContext> workers(options->threads);
+
+    auto prefill = RunPrefillIfNeeded(*options, counters);
+    if (!prefill) {
+        std::cerr << "预填充失败: " << prefill.error << '\n';
+        return 1;
+    }
 
     uint64_t warmup_errors = 0;
     auto warmup = RunWarmup(*options, workers, counters, warmup_errors);
