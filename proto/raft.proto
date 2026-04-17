@@ -129,6 +129,11 @@ message AppendEntriesRequest {
 
   // Leader 当前视角下的拓扑信息，用于跟随节点更新本地链路来源。
   TopologyInfo topology = 7;
+
+  // 实际发送本次请求的节点 ID。
+  // Leader 直发时等于 leader_id；Mentor 转发时等于 mentor 自身 ID。
+  // 接收方据此验证发送方授权，旧版节点该字段为空，视为放行（向后兼容）。
+  string sender_id = 8;
 }
 
 // 日志复制响应。

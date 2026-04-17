@@ -373,6 +373,24 @@ Result<raftvdb::proto::AppendEntriesResponse> RaftNode::HandleAppendEntries(
         }
     }
 
+    // 校验发送方授权：Follower 仅接受来自其 Mentor（source_node_id）或 Leader 的日志。
+    // sender_id 为空时视为旧版本节点，兼容处理放行。
+    if (!request.sender_id().empty() &&
+        topology_->GetRole(self_id_) == NodeRole::kFollower) {
+        const std::string expected_source = topology_->GetSource(self_id_);
+        const bool sender_is_leader = request.sender_id() == request.leader_id();
+        const bool sender_is_source = !expected_source.empty() &&
+                                      request.sender_id() == expected_source;
+        if (!sender_is_leader && !sender_is_source) {
+            LOG_WARN("APPEND_ENTRIES_UNAUTHORIZED",
+                     "node_id={}, sender={}, expected_source={}, leader={}",
+                     self_id_, request.sender_id(), expected_source, request.leader_id());
+            response.set_term(CurrentTerm());
+            response.set_success(false);
+            return Result<raftvdb::proto::AppendEntriesResponse>::Ok(std::move(response));
+        }
+    }
+
     const uint64_t prev_log_index = request.prev_log_index();
     const uint64_t snapshot_index = last_snapshot_index_.load(std::memory_order_acquire);
     const uint64_t snapshot_term = last_snapshot_term_.load(std::memory_order_acquire);
@@ -847,31 +865,46 @@ Result<raftvdb::proto::ClientWriteResponse> RaftNode::HandleClientWrite(
         }
     }
 
-    // 已经写入 WAL 后，不立即把“成功”返回给客户端，而是等待这条请求真正进入
-    // DedupTable 的 committed 状态。这样客户端只会在 apply 完成后看到 success=true，
-    // 后续重复请求也能直接走去重表返回。
+    // 等待这条请求进入 DedupTable committed 状态后才回复客户端，
+    // 使用 promise/future 代替忙轮询，不再长期占用 gRPC handler 线程 CPU。
     const auto wait_timeout = std::chrono::milliseconds(
-        std::max<uint32_t>(config_.client.retry_max_ms * 2U, config_.raft.election_timeout_max_ms * 2U));
-    const auto deadline = std::chrono::steady_clock::now() + wait_timeout;
+        std::max<uint32_t>(config_.client.retry_max_ms * 2U,
+                           config_.raft.election_timeout_max_ms * 2U));
 
-    while (std::chrono::steady_clock::now() < deadline) {
-        auto current_state = dedup_table_->Check(request.request_id(), &dedup_entry);
-        if (current_state == DedupTable::CheckResult::kAlreadyCommitted) {
-            response.set_success(dedup_entry.success);
-            response.set_error(dedup_entry.error);
+    std::promise<DedupEntry> promise;
+    auto future = promise.get_future();
+    RegisterCommitListener(request.request_id(), std::move(promise));
+
+    // double-check：Propose 返回与注册监听器之间 ApplyLoop 可能已提交
+    {
+        DedupEntry check_entry;
+        if (dedup_table_->Check(request.request_id(), &check_entry) ==
+            DedupTable::CheckResult::kAlreadyCommitted) {
+            UnregisterCommitListener(request.request_id());
+            response.set_success(check_entry.success);
+            response.set_error(check_entry.error);
             return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
         }
-
-        if (!IsLeader()) {
-            response.set_success(false);
-            response.set_redirect_to(LeaderAddr());
-            return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
-        }
-
-        std::unique_lock apply_lock(apply_mutex_);
-        apply_cv_.wait_for(apply_lock, std::chrono::milliseconds(20));
     }
 
+    if (future.wait_for(wait_timeout) == std::future_status::ready) {
+        auto committed = future.get();
+        response.set_success(committed.success);
+        response.set_error(committed.error);
+        return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
+    }
+
+    // 超时：清理监听器，再做最后一次 dedup 检查防止恰好在 wait_for 到期时提交
+    UnregisterCommitListener(request.request_id());
+    {
+        DedupEntry check_entry;
+        if (dedup_table_->Check(request.request_id(), &check_entry) ==
+            DedupTable::CheckResult::kAlreadyCommitted) {
+            response.set_success(check_entry.success);
+            response.set_error(check_entry.error);
+            return Result<raftvdb::proto::ClientWriteResponse>::Ok(std::move(response));
+        }
+    }
     response.set_success(false);
     if (!IsLeader()) {
         response.set_redirect_to(LeaderAddr());
@@ -1389,6 +1422,7 @@ Result<void> RaftNode::ReplicatePeerOnce(const std::string& peer_id) {
     }
     request.set_prev_log_term(*prev_term);
     request.set_leader_commit(CommitIndex());
+    request.set_sender_id(self_id_);
 
     auto topology = BuildTopologyForPeer(peer_id);
     if (topology) {
@@ -1506,6 +1540,7 @@ Result<void> RaftNode::ForwardToFollower(const raftvdb::proto::AppendEntriesRequ
     }
 
     raftvdb::proto::AppendEntriesRequest forwarded = request;
+    forwarded.set_sender_id(self_id_);
     auto topology = BuildTopologyForPeer(follower->node_id);
     if (topology) {
         *forwarded.mutable_topology() = *topology;
@@ -1867,11 +1902,37 @@ void RaftNode::ApplyCommittedEntries() {
 
         if (!request_id.empty()) {
             dedup_table_->Record(request_id, next_index, success, error);
+            DedupEntry committed;
+            committed.committed = true;
+            committed.success = success;
+            committed.error = error;
+            committed.log_index = next_index;
+            NotifyCommitListener(request_id, committed);
         }
 
         applied_index_.store(next_index, std::memory_order_release);
         MaybeTriggerSnapshot(next_index);
     }
+}
+
+void RaftNode::RegisterCommitListener(const std::string& request_id,
+                                      std::promise<DedupEntry> promise) {
+    std::lock_guard lock(commit_listeners_mutex_);
+    commit_listeners_.emplace(request_id, std::move(promise));
+}
+
+void RaftNode::NotifyCommitListener(const std::string& request_id, const DedupEntry& entry) {
+    std::lock_guard lock(commit_listeners_mutex_);
+    auto found = commit_listeners_.find(request_id);
+    if (found != commit_listeners_.end()) {
+        found->second.set_value(entry);
+        commit_listeners_.erase(found);
+    }
+}
+
+void RaftNode::UnregisterCommitListener(const std::string& request_id) {
+    std::lock_guard lock(commit_listeners_mutex_);
+    commit_listeners_.erase(request_id);
 }
 
 void RaftNode::MaybeTriggerSnapshot(uint64_t applied_index) {
@@ -2499,6 +2560,10 @@ void RaftNode::MaintenanceLoop(std::stop_token stop_token) {
 
 void RaftNode::MaybeRunIndexMaintenance(std::chrono::steady_clock::time_point now) {
     if (!index_maintenance_ || !vector_index_) {
+        return;
+    }
+    // 快照 clone 持写锁期间，避免 compact/isolate 再次竞争写锁加剧阻塞
+    if (snapshot_in_progress_.load(std::memory_order_acquire)) {
         return;
     }
 

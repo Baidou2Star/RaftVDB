@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -215,6 +216,10 @@ private:
     // ApplyLoop 与租约读
     // ─────────────────────────────────────────────────────────────
     void ApplyCommittedEntries();
+    void RegisterCommitListener(const std::string& request_id,
+                                std::promise<DedupEntry> promise);
+    void NotifyCommitListener(const std::string& request_id, const DedupEntry& entry);
+    void UnregisterCommitListener(const std::string& request_id);
     void MaybeTriggerSnapshot(uint64_t applied_index);
     void LaunchSnapshotTask(uint64_t snapshot_index);
     Result<void> ApplyInstalledSnapshot(const SnapshotMeta& snapshot_meta);
@@ -276,6 +281,9 @@ private:
 
     mutable std::mutex apply_mutex_;
     std::condition_variable apply_cv_;
+
+    mutable std::mutex commit_listeners_mutex_;
+    std::unordered_map<std::string, std::promise<DedupEntry>> commit_listeners_;
 
     mutable std::mutex heartbeat_mutex_;
     std::condition_variable heartbeat_cv_;
