@@ -298,8 +298,7 @@ size_t VectorIndex::Size() const {
 }
 
 size_t VectorIndex::DeletedCount() const {
-    std::shared_lock lock(mutex_);
-    return deleted_count_.load();
+    return deleted_count_.load(std::memory_order_acquire);
 }
 
 size_t VectorIndex::TotalSlots() const {

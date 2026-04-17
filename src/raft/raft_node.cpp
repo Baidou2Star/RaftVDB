@@ -1162,36 +1162,51 @@ Result<void> RaftNode::BroadcastHeartbeat(bool /*allow_async_callbacks*/) {
 
     const uint64_t term = CurrentTerm();
     const uint64_t commit_index = CommitIndex();
-    size_t success_count = 1;
+
+    // 并行向所有 peer 发送心跳，避免串行等待导致心跳总耗时超过 LeaseDuration。
+    // 模式与 StartElection 一致：每个 peer 一个线程，join 后统计结果。
+    std::mutex response_mutex;
+    size_t success_count = 1;     // Leader 自身算一票
     uint64_t highest_term = term;
 
+    std::vector<std::thread> threads;
+    threads.reserve(config_.cluster.peers.size());
+
     for (const auto& peer : config_.cluster.peers) {
-        raftvdb::proto::HeartbeatRequest request;
-        request.set_term(term);
-        request.set_leader_id(self_id_);
-        request.set_commit_index(commit_index);
+        threads.emplace_back([&, peer]() {
+            raftvdb::proto::HeartbeatRequest request;
+            request.set_term(term);
+            request.set_leader_id(self_id_);
+            request.set_commit_index(commit_index);
 
-        auto topology = BuildTopologyForPeer(peer);
-        if (topology) {
-            *request.mutable_topology() = *topology;
-        }
+            auto topology = BuildTopologyForPeer(peer);
+            if (topology) {
+                *request.mutable_topology() = *topology;
+            }
 
-        auto sent_at = std::chrono::steady_clock::now();
-        auto response = raft_client_->Heartbeat(ResolvePeerAddress(peer), request);
-        if (!response) {
-            UpdatePeerFailure(peer);
-            continue;
-        }
-        if (response->term() > highest_term) {
-            highest_term = response->term();
-            continue;
-        }
-        if (response->success()) {
-            ++success_count;
-            UpdatePeerHeartbeatAck(peer, sent_at);
-        } else {
-            UpdatePeerFailure(peer);
-        }
+            const auto sent_at = std::chrono::steady_clock::now();
+            auto response = raft_client_->Heartbeat(ResolvePeerAddress(peer), request);
+
+            std::lock_guard lock(response_mutex);
+            if (!response) {
+                UpdatePeerFailure(peer);
+                return;
+            }
+            if (response->term() > highest_term) {
+                highest_term = response->term();
+                return;
+            }
+            if (response->success()) {
+                ++success_count;
+                UpdatePeerHeartbeatAck(peer, sent_at);
+            } else {
+                UpdatePeerFailure(peer);
+            }
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
     }
 
     if (highest_term > term) {
@@ -1956,21 +1971,27 @@ void RaftNode::LaunchSnapshotTask(uint64_t snapshot_index) {
                 return;
             }
 
-            self->last_snapshot_index_.store(snapshot_index, std::memory_order_release);
-            self->last_snapshot_term_.store(*snapshot_term, std::memory_order_release);
-
-            auto truncate = self->wal_->TruncateBefore(snapshot_index);
-            if (!truncate) {
-                LOG_ERROR("SNAPSHOT_TRUNCATE_WAL_FAILED", "node_id={}, index={}, error={}", node_id,
-                          snapshot_index, truncate.error);
-            }
-
+            // ① 先持久化 dedup.bin（SaveTo 内部已用 tmp+rename 原子写）
+            // 必须在 WAL 截断之前完成，防止崩溃后 WAL 丢失但 dedup.bin 未更新，
+            // 导致重启时去重窗口内的幂等语义被破坏。
             if (dedup_table) {
                 auto save_dedup = dedup_table->SaveTo(DedupSnapshotPath(storage_config));
                 if (!save_dedup) {
                     LOG_ERROR("SNAPSHOT_SAVE_DEDUP_FAILED", "node_id={}, index={}, error={}",
                               node_id, snapshot_index, save_dedup.error);
+                    // dedup 落盘失败不阻止快照提交，但记录错误
                 }
+            }
+
+            // ② 更新内存中的快照索引
+            self->last_snapshot_index_.store(snapshot_index, std::memory_order_release);
+            self->last_snapshot_term_.store(*snapshot_term, std::memory_order_release);
+
+            // ③ 最后截断 WAL（此时 dedup.bin 已落盘，崩溃安全）
+            auto truncate = self->wal_->TruncateBefore(snapshot_index);
+            if (!truncate) {
+                LOG_ERROR("SNAPSHOT_TRUNCATE_WAL_FAILED", "node_id={}, index={}, error={}", node_id,
+                          snapshot_index, truncate.error);
             }
 
             LOG_INFO("SNAPSHOT_COMPLETED", "node_id={}, index={}", node_id, snapshot_index);
@@ -2075,6 +2096,11 @@ void RaftNode::CheckMentorTimeouts() {
         UpdatePeerFailure(mentor.node_id);
 
         if (follower && follower->healthy) {
+            // 拓扑提升是 Leader 本地决策，先更新本地状态，再通知 Follower（尽力而为）。
+            topology_->PromoteToMentor(follower->node_id);
+            topology_refresh_requested_ = true;
+            RequestImmediateHeartbeat();
+
             raftvdb::proto::HeartbeatRequest request;
             request.set_term(CurrentTerm());
             request.set_leader_id(self_id_);
@@ -2087,14 +2113,11 @@ void RaftNode::CheckMentorTimeouts() {
             auto sent_at = std::chrono::steady_clock::now();
             auto response = raft_client_->Heartbeat(ResolvePeerAddress(follower->node_id), request);
             if (response && response->success()) {
-                topology_->PromoteToMentor(follower->node_id);
                 UpdatePeerHeartbeatAck(follower->node_id, sent_at);
-                topology_refresh_requested_ = true;
-                RequestImmediateHeartbeat();
-                continue;
+            } else {
+                topology_->MarkUnhealthy(follower->node_id);
             }
-
-            topology_->MarkUnhealthy(follower->node_id);
+            continue;
         }
 
         if (HealthyPeerIds().size() + 1U < QuorumSize()) {

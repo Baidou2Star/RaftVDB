@@ -77,10 +77,7 @@ struct Config {
     static Result<Config> LoadFromFile(const std::string& path);
 
     bool IsSingleNode() const noexcept {
-        // We treat both an empty peer list and a single configured endpoint as
-        // single-node bootstrap modes so the loader stays compatible with the
-        // current docs and the earlier bootstrap template.
-        return cluster.peers.size() <= 1;
+        return cluster.peers.empty();
     }
 };
 
