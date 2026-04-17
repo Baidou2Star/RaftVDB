@@ -285,25 +285,45 @@ Result<uint64_t> RaftNode::Propose(const LogEntry& entry) {
         return Result<uint64_t>::Err("当前节点不是 Leader，无法执行 Propose");
     }
 
-    auto appended = AppendEntryLocked(entry);
-    if (!appended) {
-        return appended;
+    // Task-L1 (Append phase)：写入 WAL 缓冲区，尚未 fdatasync。
+    LogEntry next = entry;
+    next.index = LogicalLastIndex() + 1U;
+    next.term = current_term_.load(std::memory_order_acquire);
+    auto append = wal_->Append(next);
+    if (!append) {
+        return Result<uint64_t>::Err(append.error);
     }
+    const uint64_t log_index = next.index;
 
     auto request_id = ExtractRequestId(entry);
     if (request_id && !request_id->empty()) {
-        dedup_table_->TrackPending(*request_id, *appended);
+        dedup_table_->TrackPending(*request_id, log_index);
     }
 
     if (QuorumSize() == 1U) {
-        commit_index_.store(*appended, std::memory_order_release);
+        // 单节点：立即 flush，commit，不需要等 Quorum ACK。
+        auto flush = wal_->Flush();
+        if (!flush) {
+            return Result<uint64_t>::Err(flush.error);
+        }
+        flushed_index_.store(log_index, std::memory_order_release);
+        commit_index_.store(log_index, std::memory_order_release);
         apply_cv_.notify_all();
     } else {
+        // Task-L2：AppendEntries 条目已进入 WAL 缓冲区，立即触发 Pipeline。
+        // Follower 在收到该 RPC 后会写自己的 WAL；Leader 自身的 fdatasync 与此并行。
         RequestReplication();
         RequestImmediateHeartbeat();
+
+        // Task-L1（继续）：本地 fdatasync，完成后才允许 MaybeCommit 计入 Leader 自身。
+        auto flush = wal_->Flush();
+        if (!flush) {
+            return Result<uint64_t>::Err(flush.error);
+        }
+        flushed_index_.store(log_index, std::memory_order_release);
     }
 
-    return appended;
+    return Result<uint64_t>::Ok(log_index);
 }
 
 Result<uint64_t> RaftNode::LeaseRead() {
@@ -916,12 +936,17 @@ Result<raftvdb::proto::ClientSearchResponse> RaftNode::HandleClientSearch(
     const raftvdb::proto::ClientSearchRequest& request) {
     raftvdb::proto::ClientSearchResponse response;
 
-    // 搜索与写入一样，只接受 Leader 入口。
-    // 这样 DBClient 不需要区分读写的寻主逻辑，统一跟随 redirect_to 即可。
-    const auto leader_hint = LeaderAddr();
+    // 非 Leader 节点：先尝试透明转发给 Leader，转发失败才降级为重定向。
     if (!IsLeader()) {
+        const std::string leader_addr = LeaderAddr();
+        if (!leader_addr.empty() && leader_addr != self_addr_) {
+            auto forwarded = raft_client_->ForwardClientSearch(leader_addr, request);
+            if (forwarded) {
+                return forwarded;
+            }
+        }
         response.set_success(false);
-        response.set_redirect_to(leader_hint);
+        response.set_redirect_to(leader_addr);
         return Result<raftvdb::proto::ClientSearchResponse>::Ok(std::move(response));
     }
 
@@ -1322,6 +1347,7 @@ Result<uint64_t> RaftNode::AppendEntryLocked(const LogEntry& entry) {
     if (!flush) {
         return Result<uint64_t>::Err(flush.error);
     }
+    flushed_index_.store(next.index, std::memory_order_release);
     return Result<uint64_t>::Ok(next.index);
 }
 
@@ -1349,7 +1375,9 @@ Result<void> RaftNode::MaybeCommit() {
             continue;
         }
 
-        size_t matched = 1; // Leader 自身天然匹配。
+        // Leader 自身仅在 WAL 已 fdatasync 时才计入 Quorum（Task-L1/L2 并行安全约束）。
+        size_t matched =
+            flushed_index_.load(std::memory_order_acquire) >= candidate ? 1U : 0U;
         {
             std::shared_lock progress_lock(peer_progress_mutex_);
             for (const auto& [_, progress] : peer_progress_) {
@@ -1522,34 +1550,88 @@ Result<void> RaftNode::ReplicatePeerOnce(const std::string& peer_id) {
     return Result<void>::Ok();
 }
 
-Result<void> RaftNode::ForwardToFollower(const raftvdb::proto::AppendEntriesRequest& request) {
+Result<void> RaftNode::ForwardToFollower(const raftvdb::proto::AppendEntriesRequest& /*leader_request*/) {
     auto follower = topology_->GetFollowerOf(self_id_);
     if (!follower || !follower->healthy) {
         return Result<void>::Ok();
     }
 
+    // 读取 Follower 的独立复制进度（与 Leader→Mentor Pipeline 完全对称）。
+    PeerProgress snapshot;
     {
         std::shared_lock progress_lock(peer_progress_mutex_);
         auto found = peer_progress_.find(follower->node_id);
-        if (found != peer_progress_.end() &&
-            last_snapshot_index_.load(std::memory_order_acquire) > 0 &&
-            found->second.next_index <= last_snapshot_index_.load(std::memory_order_acquire)) {
-            progress_lock.unlock();
-            return SendSnapshotToPeer(follower->node_id);
+        if (found != peer_progress_.end()) {
+            snapshot = found->second;
+        } else {
+            // 首次见到该 Follower：初始化 progress，从日志尾部开始探测。
+            snapshot.peer_id = follower->node_id;
+            snapshot.next_index = LogicalLastIndex() + 1U;
         }
     }
 
-    raftvdb::proto::AppendEntriesRequest forwarded = request;
-    forwarded.set_sender_id(self_id_);
-    auto topology = BuildTopologyForPeer(follower->node_id);
-    if (topology) {
-        *forwarded.mutable_topology() = *topology;
-    } else {
-        forwarded.clear_topology();
+    // 快照追赶路径：Follower 落后于本地快照时先发快照。
+    if (last_snapshot_index_.load(std::memory_order_acquire) > 0 &&
+        snapshot.next_index <= last_snapshot_index_.load(std::memory_order_acquire)) {
+        return SendSnapshotToPeer(follower->node_id);
+    }
+
+    // in-flight 窗口控制（与 Leader→Mentor Pipeline 复用同一配置）。
+    const uint32_t window_size =
+        snapshot.effective_window_size == 0 ? config_.raft.pipeline_window_size
+                                            : snapshot.effective_window_size;
+    if (snapshot.in_flight >= window_size) {
+        return Result<void>::Ok();
+    }
+
+    // 从 Follower 的实际 next_index 读取日志（而非复用 Leader 的 prev_log_index）。
+    const uint64_t logical_last_index = LogicalLastIndex();
+    auto entries = wal_->ReadFrom(snapshot.next_index, config_.raft.batch_max_entries);
+    if (!entries) {
+        return Result<void>::Err(entries.error);
+    }
+    if (entries->empty() && snapshot.match_index >= logical_last_index) {
+        return Result<void>::Ok();
+    }
+
+    raftvdb::proto::AppendEntriesRequest fwd;
+    fwd.set_term(CurrentTerm());
+    fwd.set_leader_id(LeaderId());
+    fwd.set_prev_log_index(snapshot.next_index - 1U);
+    auto prev_term = TermAtLogicalIndex(snapshot.next_index - 1U);
+    if (!prev_term) {
+        return Result<void>::Err(prev_term.error);
+    }
+    fwd.set_prev_log_term(*prev_term);
+    fwd.set_leader_commit(CommitIndex());
+    fwd.set_sender_id(self_id_);
+
+    auto topo = BuildTopologyForPeer(follower->node_id);
+    if (topo) {
+        *fwd.mutable_topology() = *topo;
+    }
+
+    for (const auto& e : *entries) {
+        auto* proto_entry = fwd.add_entries();
+        proto_entry->set_index(e.index);
+        proto_entry->set_term(e.term);
+        proto_entry->set_type(static_cast<uint32_t>(e.type));
+        proto_entry->set_cmd_type(static_cast<uint32_t>(e.cmd_type));
+        proto_entry->set_payload(e.payload.data(), e.payload.size());
+    }
+
+    // 记录本次发送使 in_flight + 1。
+    {
+        std::unique_lock progress_lock(peer_progress_mutex_);
+        auto& p = peer_progress_[follower->node_id];
+        p.peer_id = follower->node_id;
+        p.next_index = std::max(p.next_index, snapshot.next_index);
+        p.in_flight += 1;
+        p.last_send_time = std::chrono::steady_clock::now();
     }
 
     const auto sent_at = std::chrono::steady_clock::now();
-    auto response = raft_client_->AppendEntries(ResolvePeerAddress(follower->node_id), forwarded);
+    auto response = raft_client_->AppendEntries(ResolvePeerAddress(follower->node_id), fwd);
     if (!response) {
         UpdatePeerFailure(follower->node_id);
         return Result<void>::Err(response.error);
@@ -1568,15 +1650,17 @@ Result<void> RaftNode::ForwardToFollower(const raftvdb::proto::AppendEntriesRequ
         return Result<void>::Ok();
     }
 
+    // 失败：更新回退状态，与 ReplicatePeerOnce 对称。
     std::unique_lock progress_lock(peer_progress_mutex_);
     auto& progress = peer_progress_[follower->node_id];
     progress.peer_id = follower->node_id;
-    progress.in_flight = 0;
+    if (progress.in_flight > 0) {
+        progress.in_flight -= 1;
+    }
     progress.healthy = true;
     const uint64_t conflict_index = response->conflict_index();
-    const uint64_t attempted_next_index = forwarded.prev_log_index() + 1U;
+    const uint64_t attempted_next_index = fwd.prev_log_index() + 1U;
     if (conflict_index > 0 && conflict_index < attempted_next_index) {
-        // Follower 直接返回一致性边界时，Mentor 也应直接跳转到该位置继续补发。
         progress.next_index = conflict_index;
         ResetPeerRollbackStateLocked(progress);
     } else {

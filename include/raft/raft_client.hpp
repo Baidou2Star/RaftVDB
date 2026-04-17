@@ -34,6 +34,9 @@ struct RaftClientOptions {
 
     // GetLeader 是探测接口，超时保持较短即可。
     std::chrono::milliseconds get_leader_timeout{500};
+
+    // ForwardClientSearch 透明转发搜索，给相对宽裕的超时。
+    std::chrono::milliseconds forward_search_timeout{2000};
 };
 
 class RaftClient {
@@ -76,6 +79,11 @@ public:
         SnapshotChunkProducer producer) const;
 
     Result<raftvdb::proto::LeaderInfo> GetLeader(const std::string& peer_addr) const;
+
+    // 透明转发：Follower 将客户端搜索请求转发给 Leader，避免客户端感知 Leader 变更。
+    Result<raftvdb::proto::ClientSearchResponse> ForwardClientSearch(
+        const std::string& leader_addr,
+        const raftvdb::proto::ClientSearchRequest& request) const;
 
     // 公开缓存数量，便于后续调试连接复用和测试验证。
     size_t CachedPeerCount() const;

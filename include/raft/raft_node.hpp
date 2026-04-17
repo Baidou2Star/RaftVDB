@@ -268,6 +268,9 @@ private:
     std::atomic<uint64_t> last_snapshot_index_{0};
     std::atomic<uint64_t> last_snapshot_term_{0};
     std::atomic<bool> snapshot_in_progress_{false};
+    // Task-L1/L2 并行：记录本地 WAL 已 fdatasync 的最大 index，
+    // MaybeCommit 以此判断 Leader 自身是否可计入 Quorum。
+    std::atomic<uint64_t> flushed_index_{0};
 
     mutable std::shared_mutex peer_progress_mutex_;
     std::unordered_map<std::string, PeerProgress> peer_progress_;

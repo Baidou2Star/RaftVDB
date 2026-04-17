@@ -269,6 +269,26 @@ Result<raftvdb::proto::LeaderInfo> RaftClient::GetLeader(const std::string& peer
     return FinishUnaryRpc(std::move(status), std::move(response), "GetLeader");
 }
 
+Result<raftvdb::proto::ClientSearchResponse> RaftClient::ForwardClientSearch(
+    const std::string& leader_addr,
+    const raftvdb::proto::ClientSearchRequest& request) const {
+    auto validate = ValidatePeerAddress(leader_addr);
+    if (!validate) {
+        return Result<raftvdb::proto::ClientSearchResponse>::Err(validate.error);
+    }
+
+    auto stub_result = GetOrCreateStub(leader_addr);
+    if (!stub_result) {
+        return Result<raftvdb::proto::ClientSearchResponse>::Err(stub_result.error);
+    }
+
+    grpc::ClientContext context;
+    ApplyDeadline(context, state_->options.forward_search_timeout);
+    raftvdb::proto::ClientSearchResponse response;
+    grpc::Status status = (*stub_result)->ClientSearch(&context, request, &response);
+    return FinishUnaryRpc(std::move(status), std::move(response), "ForwardClientSearch");
+}
+
 size_t RaftClient::CachedPeerCount() const {
     std::lock_guard lock(state_->mutex);
     return state_->stubs.size();
