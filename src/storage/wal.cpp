@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "common/logger.hpp"
+#include "common/perf_counters.hpp"
 
 namespace {
 
@@ -360,11 +361,13 @@ Result<void> WAL::Flush() {
     if (fd_ < 0) {
         return Result<void>::Err("WAL 未打开");
     }
+    const uint64_t t0 = NowUs();
     if (::fdatasync(fd_) != 0) {
         LOG_ERROR("WAL_SYNC_FAILED", "path={}, error={}", segments_.back().path.string(),
                   std::strerror(errno));
         return Result<void>::Err("fdatasync 失败: " + std::string(std::strerror(errno)));
     }
+    g_perf.RecordFdatasync(NowUs() - t0);
     return Result<void>::Ok();
 }
 

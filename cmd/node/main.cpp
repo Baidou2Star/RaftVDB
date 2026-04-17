@@ -8,6 +8,7 @@
 #include "client/dedup.hpp"
 #include "common/defer.hpp"
 #include "common/logger.hpp"
+#include "common/perf_counters.hpp"
 #include "raft/raft_node.hpp"
 #include "raft/raft_server.hpp"
 #include "storage/snapshot_store.hpp"
@@ -245,5 +246,11 @@ int main(int argc, char** argv) {
 
     LOG_INFO("NODE_SHUTDOWN_DONE", "commit_index={}, applied_index={}", (*node)->CommitIndex(),
              (*node)->AppliedIndex());
+
+    // 输出热路径延迟统计到 perf_stats.csv（与配置文件同目录）
+    const auto stats_path =
+        (std::filesystem::path(config_path).parent_path() / "perf_stats.csv").string();
+    g_perf.DumpToFile(stats_path);
+
     return 0;
 }

@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "common/logger.hpp"
+#include "common/perf_counters.hpp"
 #include "storage/snapshot_store.hpp"
 
 namespace {
@@ -1941,6 +1942,7 @@ void RaftNode::ApplyCommittedEntries() {
             return;
         }
 
+        const uint64_t t_apply_start = NowUs();
         bool success = true;
         std::string error;
         std::string request_id;
@@ -1994,6 +1996,7 @@ void RaftNode::ApplyCommittedEntries() {
             NotifyCommitListener(request_id, committed);
         }
 
+        g_perf.RecordApply(NowUs() - t_apply_start);
         applied_index_.store(next_index, std::memory_order_release);
         MaybeTriggerSnapshot(next_index);
     }

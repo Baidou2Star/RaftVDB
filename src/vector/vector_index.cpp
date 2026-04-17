@@ -9,6 +9,7 @@
 #include <utility>
 
 #include <vector/index_plugins.hpp>
+#include "common/perf_counters.hpp"
 
 namespace {
 
@@ -160,7 +161,9 @@ Result<void> VectorIndex::Upsert(uint64_t id, const float* vec, size_t dim) {
         return validate;
     }
 
+    const uint64_t t_before_lock = NowUs();
     std::unique_lock lock(mutex_);
+    g_perf.RecordHnswLockWait(NowUs() - t_before_lock);
 
     size_t deleted = deleted_count_.load();
     auto removed = index_.remove(id);
@@ -169,8 +172,10 @@ Result<void> VectorIndex::Upsert(uint64_t id, const float* vec, size_t dim) {
     }
     deleted += removed.completed;
 
-    // 追加写前先删旧值，维持“同一主键只保留最新向量”的覆盖语义。
+    // 追加写前先删旧值，维持”同一主键只保留最新向量”的覆盖语义。
+    const uint64_t t_insert = NowUs();
     auto added = index_.add(id, vec);
+    g_perf.RecordHnswInsert(NowUs() - t_insert);
     if (!added) {
         deleted_count_.store(deleted);
         return Result<void>::Err(FormatUsearchError("写入向量失败: ", added.error));
