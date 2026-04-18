@@ -1,0 +1,5 @@
+metric,count,mean_us,max_us
+fdatasync,8012,1447.25,5199
+hnsw_lock_wait,8011,0.057421,1
+hnsw_insert,8011,95.1314,299
+apply_per_entry,8012,120.251,325

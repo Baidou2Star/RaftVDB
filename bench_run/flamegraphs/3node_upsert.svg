@@ -1,0 +1,1282 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1800" height="438" onload="init(evt)" viewBox="0 0 1800 438" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom(true);
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				// we have basically done a clearzoom so clear the url
+				var params = get_params();
+				if (params.x) delete params.x;
+				if (params.y) delete params.y;
+				history.replaceState(null, null, parse_params(params));
+				unzoombtn.classList.add("hide");
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		var sl = t.getSubStringLength(0, txt.length);
+		// check if only whitespace or if we can fit the entire string into width w
+		if (/^ *$/.test(txt) || sl < w)
+			return;
+
+		// this isn't perfect, but gives a good starting point
+		// and avoids calling getSubStringLength too often
+		var start = Math.floor((w/sl) * txt.length);
+		for (var x = start; x > 0; x = x-2) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom(dont_update_text) {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			if(!dont_update_text) update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+		if (currentSearchTerm === null) return;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1800.0" height="438.0" fill="url(#background)"  />
+<text id="title" x="900.00" y="24" >3-node Leader CPU: upsert+search</text>
+<text id="details" x="10.00" y="421" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1690.00" y="24" >Search</text>
+<text id="ignorecase" x="1774.00" y="24" >ic</text>
+<text id="matched" x="1690.00" y="421" > </text>
+<g id="frames">
+<g >
+<title>grpc_core::(anonymous namespace)::InitTransportClosure&lt;&amp;(read_action_locked(grpc_core::RefCountedPtr&lt;grpc_chttp2_transpo (100 samples, 0.35%)</title><rect x="1773.3" y="213" width="6.2" height="15.0" fill="rgb(177,177,51)" rx="2" ry="2" />
+<text  x="1776.28" y="223.5" ></text>
+</g>
+<g >
+<title>AbslInternalPerThreadSemWait_lts_20250814 (120 samples, 0.42%)</title><rect x="1722.5" y="293" width="7.4" height="15.0" fill="rgb(232,96,96)" rx="2" ry="2" />
+<text  x="1725.51" y="303.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;grpc::Status (raftvdb::proto::RaftService::Service*, grpc::ServerContext*, raftvdb::proto::Reques (600 samples, 2.09%)</title><rect x="1567.1" y="261" width="37.2" height="15.0" fill="rgb(184,184,53)" rx="2" ry="2" />
+<text  x="1570.11" y="271.5" >std..</text>
+</g>
+<g >
+<title>absl::synchronization_internal::FutexWaiter::Poke() (20 samples, 0.07%)</title><rect x="1699.6" y="181" width="1.2" height="15.0" fill="rgb(213,213,63)" rx="2" ry="2" />
+<text  x="1702.61" y="191.5" ></text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::PosixEndpointImpl::TcpFlush(absl::Status&amp;) (40 samples, 0.14%)</title><rect x="1784.4" y="149" width="2.5" height="15.0" fill="rgb(229,229,69)" rx="2" ry="2" />
+<text  x="1787.43" y="159.5" ></text>
+</g>
+<g >
+<title>RaftNode::HealthyPeerIds[abi:cxx11]() const (70 samples, 0.24%)</title><rect x="1367.1" y="293" width="4.4" height="15.0" fill="rgb(228,228,69)" rx="2" ry="2" />
+<text  x="1370.13" y="303.5" ></text>
+</g>
+<g >
+<title>HNSW::ip_distance (80 samples, 0.28%)</title><rect x="1196.3" y="213" width="4.9" height="15.0" fill="rgb(208,208,62)" rx="2" ry="2" />
+<text  x="1199.25" y="223.5" ></text>
+</g>
+<g >
+<title>absl::Mutex::Wakeup(absl::base_internal::PerThreadSynch*) (30 samples, 0.10%)</title><rect x="1768.9" y="117" width="1.9" height="15.0" fill="rgb(199,199,58)" rx="2" ry="2" />
+<text  x="1771.95" y="127.5" ></text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::(anonymous namespace)::EndpointWrite(grpc_endpoint*, grpc_slice_buffer*, grpc_closure*, (100 samples, 0.35%)</title><rect x="1780.7" y="197" width="6.2" height="15.0" fill="rgb(179,179,51)" rx="2" ry="2" />
+<text  x="1783.71" y="207.5" ></text>
+</g>
+<g >
+<title>gpr_cpu_current_cpu (30 samples, 0.10%)</title><rect x="1559.1" y="181" width="1.8" height="15.0" fill="rgb(226,88,88)" rx="2" ry="2" />
+<text  x="1562.06" y="191.5" ></text>
+</g>
+<g >
+<title>grpc::internal::CallOpSet&lt;grpc::internal::CallOpSendInitialMetadata, grpc::internal::CallOpSendMessage, grpc::internal:: (240 samples, 0.83%)</title><rect x="1605.5" y="245" width="14.9" height="15.0" fill="rgb(203,203,60)" rx="2" ry="2" />
+<text  x="1608.50" y="255.5" ></text>
+</g>
+<g >
+<title>(anonymous namespace)::ReadExactly(int, unsigned long, char*, unsigned long, unsigned long*) [clone .constprop.0] (40 samples, 0.14%)</title><rect x="1256.3" y="229" width="2.5" height="15.0" fill="rgb(185,185,53)" rx="2" ry="2" />
+<text  x="1259.31" y="239.5" ></text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::PosixEndpointImpl::Write(absl::AnyInvocable&lt;void (absl::Status)&gt;, grpc_event_engine::ex (60 samples, 0.21%)</title><rect x="1783.2" y="165" width="3.7" height="15.0" fill="rgb(182,182,52)" rx="2" ry="2" />
+<text  x="1786.19" y="175.5" ></text>
+</g>
+<g >
+<title>grpc_core::promise_filter_detail::BaseCallData::Flusher::~Flusher() (60 samples, 0.21%)</title><rect x="1612.3" y="117" width="3.7" height="15.0" fill="rgb(209,209,62)" rx="2" ry="2" />
+<text  x="1615.31" y="127.5" ></text>
+</g>
+<g >
+<title>nanosleep (10 samples, 0.03%)</title><rect x="1788.1" y="373" width="0.7" height="15.0" fill="rgb(227,89,89)" rx="2" ry="2" />
+<text  x="1791.14" y="383.5" ></text>
+</g>
+<g >
+<title>RaftMeta::Save(std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const&amp;) const (20 samples, 0.07%)</title><rect x="1268.1" y="245" width="1.2" height="15.0" fill="rgb(181,181,52)" rx="2" ry="2" />
+<text  x="1271.07" y="255.5" ></text>
+</g>
+<g >
+<title>gRPC::FilterStackCall (90 samples, 0.31%)</title><rect x="1765.2" y="213" width="5.6" height="15.0" fill="rgb(175,175,50)" rx="2" ry="2" />
+<text  x="1768.23" y="223.5" ></text>
+</g>
+<g >
+<title>grpc_core::PipeReceiver&lt;std::unique_ptr&lt;grpc_metadata_batch, grpc_core::Arena::PooledDeleter&gt; &gt;::Next()::{lambda(std::op (20 samples, 0.07%)</title><rect x="1614.8" y="53" width="1.2" height="15.0" fill="rgb(214,214,64)" rx="2" ry="2" />
+<text  x="1617.79" y="63.5" ></text>
+</g>
+<g >
+<title>absl::CondVar::WaitCommon(absl::Mutex*, absl::synchronization_internal::KernelTimeout) (10 samples, 0.03%)</title><rect x="1712.6" y="277" width="0.6" height="15.0" fill="rgb(175,175,50)" rx="2" ry="2" />
+<text  x="1715.61" y="287.5" ></text>
+</g>
+<g >
+<title>TopologyManager::AllNodes() const (30 samples, 0.10%)</title><rect x="1282.3" y="277" width="1.9" height="15.0" fill="rgb(191,191,55)" rx="2" ry="2" />
+<text  x="1285.31" y="287.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_lock (10 samples, 0.03%)</title><rect x="1499.6" y="293" width="0.6" height="15.0" fill="rgb(246,118,118)" rx="2" ry="2" />
+<text  x="1502.63" y="303.5" ></text>
+</g>
+<g >
+<title>absl::CondVar::WaitCommon(absl::Mutex*, absl::synchronization_internal::KernelTimeout) (10 samples, 0.03%)</title><rect x="1705.8" y="277" width="0.6" height="15.0" fill="rgb(175,175,50)" rx="2" ry="2" />
+<text  x="1708.80" y="287.5" ></text>
+</g>
+<g >
+<title>AbslInternalPerThreadSemWait_lts_20250814 (80 samples, 0.28%)</title><rect x="1707.7" y="261" width="4.9" height="15.0" fill="rgb(232,96,96)" rx="2" ry="2" />
+<text  x="1710.66" y="271.5" ></text>
+</g>
+<g >
+<title>pollset_work(grpc_pollset*, grpc_pollset_worker**, grpc_core::Timestamp) (50 samples, 0.17%)</title><rect x="1557.8" y="213" width="3.1" height="15.0" fill="rgb(175,175,50)" rx="2" ry="2" />
+<text  x="1560.83" y="223.5" ></text>
+</g>
+<g >
+<title>unsigned int unum::usearch::index_gt&lt;float, unsigned long, unsigned int, unum::usearch::aligned_allocator_gt&lt;char, 64ul&gt; (60 samples, 0.21%)</title><rect x="1180.2" y="245" width="3.7" height="15.0" fill="rgb(183,183,53)" rx="2" ry="2" />
+<text  x="1183.16" y="255.5" ></text>
+</g>
+<g >
+<title>syscall (10 samples, 0.03%)</title><rect x="1770.2" y="85" width="0.6" height="15.0" fill="rgb(232,97,97)" rx="2" ry="2" />
+<text  x="1773.19" y="95.5" ></text>
+</g>
+<g >
+<title>absl::CondVar::Remove(absl::base_internal::PerThreadSynch*) (10 samples, 0.03%)</title><rect x="1729.9" y="293" width="0.7" height="15.0" fill="rgb(198,198,58)" rx="2" ry="2" />
+<text  x="1732.94" y="303.5" ></text>
+</g>
+<g >
+<title>absl::synchronization_internal::FutexWaiter::Wait(absl::synchronization_internal::KernelTimeout) (60 samples, 0.21%)</title><rect x="1708.9" y="245" width="3.7" height="15.0" fill="rgb(206,206,61)" rx="2" ry="2" />
+<text  x="1711.89" y="255.5" ></text>
+</g>
+<g >
+<title>gRPC::HandleRead (20 samples, 0.07%)</title><rect x="1754.1" y="277" width="1.2" height="15.0" fill="rgb(187,187,54)" rx="2" ry="2" />
+<text  x="1757.09" y="287.5" ></text>
+</g>
+<g >
+<title>malloc (10 samples, 0.03%)</title><rect x="1283.6" y="245" width="0.6" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="1286.55" y="255.5" ></text>
+</g>
+<g >
+<title>absl::Mutex::Wakeup(absl::base_internal::PerThreadSynch*) (30 samples, 0.10%)</title><rect x="1699.0" y="197" width="1.8" height="15.0" fill="rgb(199,199,58)" rx="2" ry="2" />
+<text  x="1701.99" y="207.5" ></text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::PosixEndpoint::Write(absl::AnyInvocable&lt;void (absl::Status)&gt;, grpc_event_engine::experi (80 samples, 0.28%)</title><rect x="1782.0" y="181" width="4.9" height="15.0" fill="rgb(188,188,55)" rx="2" ry="2" />
+<text  x="1784.95" y="191.5" ></text>
+</g>
+<g >
+<title>gRPC::WorkStealingThreadPool (240 samples, 0.83%)</title><rect x="1676.7" y="293" width="14.9" height="15.0" fill="rgb(193,193,56)" rx="2" ry="2" />
+<text  x="1679.70" y="303.5" ></text>
+</g>
+<g >
+<title>grpc_core::GlobalStatsPluginRegistry::StatsPluginGroup::AddServerCallTracers(grpc_core::Arena*) (10 samples, 0.03%)</title><rect x="1778.9" y="69" width="0.6" height="15.0" fill="rgb(215,215,64)" rx="2" ry="2" />
+<text  x="1781.86" y="79.5" ></text>
+</g>
+<g >
+<title>operator new(unsigned long) (20 samples, 0.07%)</title><rect x="1282.9" y="261" width="1.3" height="15.0" fill="rgb(231,95,95)" rx="2" ry="2" />
+<text  x="1285.93" y="271.5" ></text>
+</g>
+<g >
+<title>grpc_core::Server::CallData::Publish(unsigned long, grpc_core::Server::RequestedCall*) (70 samples, 0.24%)</title><rect x="1766.5" y="181" width="4.3" height="15.0" fill="rgb(183,183,53)" rx="2" ry="2" />
+<text  x="1769.47" y="191.5" ></text>
+</g>
+<g >
+<title>grpc_core::(anonymous namespace)::ThreadInternalsPosix::ThreadInternalsPosix(char const*, void (*)(void*), void*, bool*, (1,550 samples, 5.39%)</title><rect x="1524.4" y="341" width="96.0" height="15.0" fill="rgb(187,187,54)" rx="2" ry="2" />
+<text  x="1527.39" y="351.5" >grpc_core::..</text>
+</g>
+<g >
+<title>open (10 samples, 0.03%)</title><rect x="1268.7" y="229" width="0.6" height="15.0" fill="rgb(205,57,57)" rx="2" ry="2" />
+<text  x="1271.69" y="239.5" ></text>
+</g>
+<g >
+<title>[libc.so.6 internal] (1,000 samples, 3.48%)</title><rect x="1437.7" y="277" width="61.9" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="1440.71" y="287.5" >[libc...</text>
+</g>
+<g >
+<title>RaftNode::ApplyLoop(std::stop_token) (8,310 samples, 28.90%)</title><rect x="744.3" y="309" width="514.5" height="15.0" fill="rgb(177,177,51)" rx="2" ry="2" />
+<text  x="747.29" y="319.5" >RaftNode::ApplyLoop(std::stop_token)</text>
+</g>
+<g >
+<title>WAL::ReadUnlocked(unsigned long) const (10 samples, 0.03%)</title><rect x="1603.6" y="149" width="0.7" height="15.0" fill="rgb(207,207,61)" rx="2" ry="2" />
+<text  x="1606.64" y="159.5" ></text>
+</g>
+<g >
+<title>gRPC::WorkStealingThreadPool (2,690 samples, 9.36%)</title><rect x="1620.4" y="373" width="166.5" height="15.0" fill="rgb(193,193,56)" rx="2" ry="2" />
+<text  x="1623.36" y="383.5" >gRPC::WorkStealingThr..</text>
+</g>
+<g >
+<title>unum::usearch::index_gt&lt;float, unsigned long, unsigned int, unum::usearch::aligned_allocator_gt&lt;char, 64ul&gt;, unum::usear (3,810 samples, 13.25%)</title><rect x="1011.1" y="261" width="235.9" height="15.0" fill="rgb(219,219,66)" rx="2" ry="2" />
+<text  x="1014.13" y="271.5" >unum::usearch::index_gt&lt;float, ..</text>
+</g>
+<g >
+<title>gpr_cpu_num_cores (20 samples, 0.07%)</title><rect x="1559.7" y="165" width="1.2" height="15.0" fill="rgb(215,73,73)" rx="2" ry="2" />
+<text  x="1562.68" y="175.5" ></text>
+</g>
+<g >
+<title>RaftNode::PersistMetaLocked(unsigned long, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; (240 samples, 0.83%)</title><rect x="1586.3" y="197" width="14.9" height="15.0" fill="rgb(183,183,52)" rx="2" ry="2" />
+<text  x="1589.31" y="207.5" ></text>
+</g>
+<g >
+<title>grpc_call_next_op(grpc_call_element*, grpc_transport_stream_op_batch*) (50 samples, 0.17%)</title><rect x="1612.9" y="101" width="3.1" height="15.0" fill="rgb(253,128,128)" rx="2" ry="2" />
+<text  x="1615.93" y="111.5" ></text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::PosixEndpointImpl::Write(absl::AnyInvocable&lt;void (absl::Status)&gt;, grpc_event_engine::ex (30 samples, 0.10%)</title><rect x="1618.5" y="133" width="1.9" height="15.0" fill="rgb(182,182,52)" rx="2" ry="2" />
+<text  x="1621.50" y="143.5" ></text>
+</g>
+<g >
+<title>RaftNode::ElectionLoop(std::stop_token) (360 samples, 1.25%)</title><rect x="1258.8" y="309" width="22.3" height="15.0" fill="rgb(183,183,53)" rx="2" ry="2" />
+<text  x="1261.79" y="319.5" >R..</text>
+</g>
+<g >
+<title>HNSW::invoke_metric (10 samples, 0.03%)</title><rect x="10.0" y="373" width="0.6" height="15.0" fill="rgb(181,181,52)" rx="2" ry="2" />
+<text  x="13.00" y="383.5" ></text>
+</g>
+<g >
+<title>syscall (40 samples, 0.14%)</title><rect x="1689.1" y="213" width="2.5" height="15.0" fill="rgb(232,97,97)" rx="2" ry="2" />
+<text  x="1692.08" y="223.5" ></text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::PosixEndpoint::Write(absl::AnyInvocable&lt;void (absl::Status)&gt;, grpc_event_engine::experi (40 samples, 0.14%)</title><rect x="1617.9" y="149" width="2.5" height="15.0" fill="rgb(188,188,55)" rx="2" ry="2" />
+<text  x="1620.88" y="159.5" ></text>
+</g>
+<g >
+<title>HNSW::ip_distance (160 samples, 0.56%)</title><rect x="1237.1" y="197" width="9.9" height="15.0" fill="rgb(208,208,62)" rx="2" ry="2" />
+<text  x="1240.12" y="207.5" ></text>
+</g>
+<g >
+<title>grpc_pollset_work(grpc_pollset*, grpc_pollset_worker**, grpc_core::Timestamp) (60 samples, 0.21%)</title><rect x="1557.2" y="229" width="3.7" height="15.0" fill="rgb(198,198,58)" rx="2" ry="2" />
+<text  x="1560.21" y="239.5" ></text>
+</g>
+<g >
+<title>HNSW::invoke_metric (40 samples, 0.14%)</title><rect x="1181.4" y="229" width="2.5" height="15.0" fill="rgb(181,181,52)" rx="2" ry="2" />
+<text  x="1184.39" y="239.5" ></text>
+</g>
+<g >
+<title>std::filesystem::create_directories(std::filesystem::__cxx11::path const&amp;, std::error_code&amp;) (30 samples, 0.10%)</title><rect x="1598.7" y="149" width="1.8" height="15.0" fill="rgb(215,215,64)" rx="2" ry="2" />
+<text  x="1601.69" y="159.5" ></text>
+</g>
+<g >
+<title>gRPC::ServerCallData (70 samples, 0.24%)</title><rect x="1611.7" y="133" width="4.3" height="15.0" fill="rgb(220,220,66)" rx="2" ry="2" />
+<text  x="1614.69" y="143.5" ></text>
+</g>
+<g >
+<title>gRPC::Epoll1Poller::Work (130 samples, 0.45%)</title><rect x="1694.0" y="277" width="8.1" height="15.0" fill="rgb(221,221,66)" rx="2" ry="2" />
+<text  x="1697.03" y="287.5" ></text>
+</g>
+<g >
+<title>gpr_once_init (10 samples, 0.03%)</title><rect x="1560.3" y="149" width="0.6" height="15.0" fill="rgb(221,81,81)" rx="2" ry="2" />
+<text  x="1563.30" y="159.5" ></text>
+</g>
+<g >
+<title>WAL::Read(unsigned long) (190 samples, 0.66%)</title><rect x="1247.0" y="277" width="11.8" height="15.0" fill="rgb(228,228,69)" rx="2" ry="2" />
+<text  x="1250.02" y="287.5" ></text>
+</g>
+<g >
+<title>RaftNode::BecomeLeader() (10 samples, 0.03%)</title><rect x="1265.0" y="293" width="0.6" height="15.0" fill="rgb(180,180,52)" rx="2" ry="2" />
+<text  x="1267.98" y="303.5" ></text>
+</g>
+<g >
+<title>gRPC::FilterStackCall (20 samples, 0.07%)</title><rect x="1778.2" y="85" width="1.3" height="15.0" fill="rgb(175,175,50)" rx="2" ry="2" />
+<text  x="1781.24" y="95.5" ></text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::(anonymous namespace)::EventEngineEndpointWrapper::FinishPendingRead(absl::Status) (460 samples, 1.60%)</title><rect x="1758.4" y="261" width="28.5" height="15.0" fill="rgb(186,186,54)" rx="2" ry="2" />
+<text  x="1761.42" y="271.5" >gr..</text>
+</g>
+<g >
+<title>cq_end_op_for_next(grpc_completion_queue*, void*, absl::Status, void (*)(void*, grpc_cq_completion*), void*, grpc_cq_com (50 samples, 0.17%)</title><rect x="1767.7" y="149" width="3.1" height="15.0" fill="rgb(200,200,59)" rx="2" ry="2" />
+<text  x="1770.71" y="159.5" ></text>
+</g>
+<g >
+<title>clock_gettime (30 samples, 0.10%)</title><rect x="1521.3" y="277" width="1.9" height="15.0" fill="rgb(209,63,63)" rx="2" ry="2" />
+<text  x="1524.30" y="287.5" ></text>
+</g>
+<g >
+<title>cq_pluck(grpc_completion_queue*, void*, gpr_timespec, void*) (70 samples, 0.24%)</title><rect x="1556.6" y="245" width="4.3" height="15.0" fill="rgb(244,114,114)" rx="2" ry="2" />
+<text  x="1559.59" y="255.5" ></text>
+</g>
+<g >
+<title>[raftvdb-node internal] (10 samples, 0.03%)</title><rect x="1370.2" y="261" width="0.6" height="15.0" fill="rgb(224,84,84)" rx="2" ry="2" />
+<text  x="1373.23" y="271.5" ></text>
+</g>
+<g >
+<title>[libc.so.6 internal] (10 samples, 0.03%)</title><rect x="1370.8" y="277" width="0.7" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="1373.85" y="287.5" ></text>
+</g>
+<g >
+<title>grpc_call_next_op(grpc_call_element*, grpc_transport_stream_op_batch*) (80 samples, 0.28%)</title><rect x="1611.1" y="149" width="4.9" height="15.0" fill="rgb(253,128,128)" rx="2" ry="2" />
+<text  x="1614.07" y="159.5" ></text>
+</g>
+<g >
+<title>absl::Mutex::UnlockSlow (40 samples, 0.14%)</title><rect x="1698.4" y="213" width="2.4" height="15.0" fill="rgb(180,180,51)" rx="2" ry="2" />
+<text  x="1701.37" y="223.5" ></text>
+</g>
+<g >
+<title>gRPC::WorkStealingThreadPool (50 samples, 0.17%)</title><rect x="1697.7" y="229" width="3.1" height="15.0" fill="rgb(193,193,56)" rx="2" ry="2" />
+<text  x="1700.75" y="239.5" ></text>
+</g>
+<g >
+<title>pthread_cond_clockwait (10 samples, 0.03%)</title><rect x="1789.4" y="373" width="0.6" height="15.0" fill="rgb(204,56,56)" rx="2" ry="2" />
+<text  x="1792.38" y="383.5" ></text>
+</g>
+<g >
+<title>RaftNode::BecomeLeader() (40 samples, 0.14%)</title><rect x="1269.3" y="277" width="2.5" height="15.0" fill="rgb(180,180,52)" rx="2" ry="2" />
+<text  x="1272.31" y="287.5" ></text>
+</g>
+<g >
+<title>HNSW::invoke_metric (160 samples, 0.56%)</title><rect x="1191.3" y="229" width="9.9" height="15.0" fill="rgb(181,181,52)" rx="2" ry="2" />
+<text  x="1194.30" y="239.5" ></text>
+</g>
+<g >
+<title>malloc (10 samples, 0.03%)</title><rect x="1701.5" y="213" width="0.6" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="1704.46" y="223.5" ></text>
+</g>
+<g >
+<title>init_header_frame_parser(grpc_chttp2_transport*, int, unsigned long&amp;) [clone .constprop.0] (60 samples, 0.21%)</title><rect x="1775.8" y="149" width="3.7" height="15.0" fill="rgb(226,88,88)" rx="2" ry="2" />
+<text  x="1778.76" y="159.5" ></text>
+</g>
+<g >
+<title>grpc::internal::RpcMethodHandler&lt;raftvdb::proto::RaftService::Service, raftvdb::proto::RequestVoteRequest, raftvdb::prot (960 samples, 3.34%)</title><rect x="1560.9" y="277" width="59.5" height="15.0" fill="rgb(203,203,60)" rx="2" ry="2" />
+<text  x="1563.92" y="287.5" >grpc::..</text>
+</g>
+<g >
+<title>WAL::ReadRecordAtUnlocked(WAL::EntryLocation const&amp;) const (90 samples, 0.31%)</title><rect x="1253.2" y="245" width="5.6" height="15.0" fill="rgb(187,187,54)" rx="2" ry="2" />
+<text  x="1256.21" y="255.5" ></text>
+</g>
+<g >
+<title>pread (20 samples, 0.07%)</title><rect x="1257.5" y="213" width="1.3" height="15.0" fill="rgb(225,87,87)" rx="2" ry="2" />
+<text  x="1260.55" y="223.5" ></text>
+</g>
+<g >
+<title>RaftNode::TermAtLogicalIndex(unsigned long) const (40 samples, 0.14%)</title><rect x="1601.8" y="197" width="2.5" height="15.0" fill="rgb(175,175,50)" rx="2" ry="2" />
+<text  x="1604.78" y="207.5" ></text>
+</g>
+<g >
+<title>fsync (30 samples, 0.10%)</title><rect x="1595.0" y="165" width="1.8" height="15.0" fill="rgb(227,89,89)" rx="2" ry="2" />
+<text  x="1597.97" y="175.5" ></text>
+</g>
+<g >
+<title>absl::synchronization_internal::FutexWaiter::Wait(absl::synchronization_internal::KernelTimeout) (90 samples, 0.31%)</title><rect x="1724.4" y="277" width="5.5" height="15.0" fill="rgb(206,206,61)" rx="2" ry="2" />
+<text  x="1727.37" y="287.5" ></text>
+</g>
+<g >
+<title>nanosleep (150 samples, 0.52%)</title><rect x="1271.8" y="293" width="9.3" height="15.0" fill="rgb(227,89,89)" rx="2" ry="2" />
+<text  x="1274.79" y="303.5" ></text>
+</g>
+<g >
+<title>rename (20 samples, 0.07%)</title><rect x="1596.8" y="165" width="1.3" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="1599.83" y="175.5" ></text>
+</g>
+<g >
+<title>gRPC::WorkStealingThreadPool (480 samples, 1.67%)</title><rect x="1713.2" y="325" width="29.7" height="15.0" fill="rgb(193,193,56)" rx="2" ry="2" />
+<text  x="1716.23" y="335.5" >gR..</text>
+</g>
+<g >
+<title>absl::synchronization_internal::FutexWaiter::Poke() (20 samples, 0.07%)</title><rect x="1769.6" y="101" width="1.2" height="15.0" fill="rgb(213,213,63)" rx="2" ry="2" />
+<text  x="1772.57" y="111.5" ></text>
+</g>
+<g >
+<title>WAL::TermAt(unsigned long) (30 samples, 0.10%)</title><rect x="1602.4" y="181" width="1.9" height="15.0" fill="rgb(228,228,69)" rx="2" ry="2" />
+<text  x="1605.40" y="191.5" ></text>
+</g>
+<g >
+<title>gRPC::SelfDeletingClosure (720 samples, 2.50%)</title><rect x="1668.7" y="325" width="44.5" height="15.0" fill="rgb(217,217,65)" rx="2" ry="2" />
+<text  x="1671.65" y="335.5" >gRPC..</text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::TimerManager::WaitUntil(grpc_core::Timestamp) (150 samples, 0.52%)</title><rect x="1703.9" y="293" width="9.3" height="15.0" fill="rgb(187,187,54)" rx="2" ry="2" />
+<text  x="1706.94" y="303.5" ></text>
+</g>
+<g >
+<title>RaftServer::ServiceImpl::RequestVote(grpc::ServerContext*, raftvdb::proto::RequestVoteRequest const*, raftvdb::proto::Re (520 samples, 1.81%)</title><rect x="1572.1" y="245" width="32.2" height="15.0" fill="rgb(186,186,54)" rx="2" ry="2" />
+<text  x="1575.07" y="255.5" >Ra..</text>
+</g>
+<g >
+<title>void absl::functional_internal::InvokeObject&lt;grpc_event_engine::experimental::PosixEventEngine::PollerWorkInternal(std:: (110 samples, 0.38%)</title><rect x="1695.3" y="261" width="6.8" height="15.0" fill="rgb(209,209,62)" rx="2" ry="2" />
+<text  x="1698.27" y="271.5" ></text>
+</g>
+<g >
+<title>unum::usearch::span_gt&lt;unum::usearch::index_gt&lt;float, unsigned long, unsigned int, unum::usearch::aligned_allocator_gt&lt;c (240 samples, 0.83%)</title><rect x="1186.3" y="245" width="14.9" height="15.0" fill="rgb(192,192,56)" rx="2" ry="2" />
+<text  x="1189.35" y="255.5" ></text>
+</g>
+<g >
+<title>read_action_locked(grpc_core::RefCountedPtr&lt;grpc_chttp2_transport&gt;, absl::Status) (90 samples, 0.31%)</title><rect x="1773.9" y="197" width="5.6" height="15.0" fill="rgb(197,197,58)" rx="2" ry="2" />
+<text  x="1776.90" y="207.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_unlock (310 samples, 1.08%)</title><rect x="1500.2" y="293" width="19.2" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="1503.25" y="303.5" ></text>
+</g>
+<g >
+<title>TopologyManager::AllNodes() const (30 samples, 0.10%)</title><rect x="1369.0" y="277" width="1.8" height="15.0" fill="rgb(191,191,55)" rx="2" ry="2" />
+<text  x="1371.99" y="287.5" ></text>
+</g>
+<g >
+<title>grpc_core::ExecCtx::Flush() (200 samples, 0.70%)</title><rect x="1608.0" y="213" width="12.4" height="15.0" fill="rgb(199,199,58)" rx="2" ry="2" />
+<text  x="1610.98" y="223.5" ></text>
+</g>
+<g >
+<title>RaftNode::ApplyCommittedEntries() (6,870 samples, 23.90%)</title><rect x="833.4" y="293" width="425.4" height="15.0" fill="rgb(182,182,52)" rx="2" ry="2" />
+<text  x="836.44" y="303.5" >RaftNode::ApplyCommittedEntries()</text>
+</g>
+<g >
+<title>grpc_call_create(grpc_call_create_args*, grpc_call**) (30 samples, 0.10%)</title><rect x="1777.6" y="101" width="1.9" height="15.0" fill="rgb(237,105,105)" rx="2" ry="2" />
+<text  x="1780.62" y="111.5" ></text>
+</g>
+<g >
+<title>unum::usearch::span_gt&lt;unum::usearch::index_gt&lt;float, unsigned long, unsigned int, unum::usearch::aligned_allocator_gt&lt;c (540 samples, 1.88%)</title><rect x="1213.6" y="229" width="33.4" height="15.0" fill="rgb(192,192,56)" rx="2" ry="2" />
+<text  x="1216.59" y="239.5" >un..</text>
+</g>
+<g >
+<title>grpc::internal::RpcMethodHandler&lt;raftvdb::proto::RaftService::Service, raftvdb::proto::Empty, raftvdb::proto::LeaderInfo (90 samples, 0.31%)</title><rect x="1555.3" y="277" width="5.6" height="15.0" fill="rgb(220,220,66)" rx="2" ry="2" />
+<text  x="1558.35" y="287.5" ></text>
+</g>
+<g >
+<title>HNSW::invoke_metric (340 samples, 1.18%)</title><rect x="1226.0" y="213" width="21.0" height="15.0" fill="rgb(181,181,52)" rx="2" ry="2" />
+<text  x="1228.97" y="223.5" ></text>
+</g>
+<g >
+<title>[libc.so.6 internal] (10 samples, 0.03%)</title><rect x="1280.5" y="261" width="0.6" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="1283.46" y="271.5" ></text>
+</g>
+<g >
+<title>grpc_chttp2_parsing_accept_stream(grpc_chttp2_transport*, unsigned int) (50 samples, 0.17%)</title><rect x="1776.4" y="133" width="3.1" height="15.0" fill="rgb(224,86,86)" rx="2" ry="2" />
+<text  x="1779.38" y="143.5" ></text>
+</g>
+<g >
+<title>grpc_core::InterceptorList&lt;std::unique_ptr&lt;grpc_metadata_batch, grpc_core::Arena::PooledDeleter&gt; &gt;::MapImpl&lt;grpc_core::p (10 samples, 0.03%)</title><rect x="1615.4" y="37" width="0.6" height="15.0" fill="rgb(175,175,50)" rx="2" ry="2" />
+<text  x="1618.41" y="47.5" ></text>
+</g>
+<g >
+<title>gRPC::WorkStealingThreadPool (2,170 samples, 7.55%)</title><rect x="1652.6" y="341" width="134.3" height="15.0" fill="rgb(193,193,56)" rx="2" ry="2" />
+<text  x="1655.55" y="351.5" >gRPC::WorkSteali..</text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::PosixEngineClosure::Run() (710 samples, 2.47%)</title><rect x="1742.9" y="325" width="44.0" height="15.0" fill="rgb(191,191,55)" rx="2" ry="2" />
+<text  x="1745.95" y="335.5" >grpc..</text>
+</g>
+<g >
+<title>absl::CondVar::WaitCommon(absl::Mutex*, absl::synchronization_internal::KernelTimeout) [clone .cold] (100 samples, 0.35%)</title><rect x="1706.4" y="277" width="6.2" height="15.0" fill="rgb(211,211,63)" rx="2" ry="2" />
+<text  x="1709.42" y="287.5" ></text>
+</g>
+<g >
+<title>grpc::ServerContextBase::CompletionOp::Unref() (10 samples, 0.03%)</title><rect x="1554.7" y="261" width="0.6" height="15.0" fill="rgb(215,215,64)" rx="2" ry="2" />
+<text  x="1557.73" y="271.5" ></text>
+</g>
+<g >
+<title>WAL::Flush() (20 samples, 0.07%)</title><rect x="1270.5" y="245" width="1.3" height="15.0" fill="rgb(221,221,67)" rx="2" ry="2" />
+<text  x="1273.55" y="255.5" ></text>
+</g>
+<g >
+<title>absl::Mutex::UnlockSlow (160 samples, 0.56%)</title><rect x="1730.6" y="309" width="9.9" height="15.0" fill="rgb(180,180,51)" rx="2" ry="2" />
+<text  x="1733.56" y="319.5" ></text>
+</g>
+<g >
+<title>gRPC::ServerCallData (40 samples, 0.14%)</title><rect x="1613.5" y="85" width="2.5" height="15.0" fill="rgb(220,220,66)" rx="2" ry="2" />
+<text  x="1616.55" y="95.5" ></text>
+</g>
+<g >
+<title>RaftNode::PersistMetaLocked(unsigned long, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; (30 samples, 0.10%)</title><rect x="1267.5" y="261" width="1.8" height="15.0" fill="rgb(183,183,52)" rx="2" ry="2" />
+<text  x="1270.45" y="271.5" ></text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::PosixEndpointImpl::TcpFlush(absl::Status&amp;) (20 samples, 0.07%)</title><rect x="1619.1" y="117" width="1.3" height="15.0" fill="rgb(229,229,69)" rx="2" ry="2" />
+<text  x="1622.12" y="127.5" ></text>
+</g>
+<g >
+<title>grpc_cq_end_op(grpc_completion_queue*, void*, absl::Status, void (*)(void*, grpc_cq_completion*), void*, grpc_cq_complet (60 samples, 0.21%)</title><rect x="1767.1" y="165" width="3.7" height="15.0" fill="rgb(229,229,69)" rx="2" ry="2" />
+<text  x="1770.09" y="175.5" ></text>
+</g>
+<g >
+<title>grpc_call_start_batch (220 samples, 0.77%)</title><rect x="1606.7" y="229" width="13.7" height="15.0" fill="rgb(217,75,75)" rx="2" ry="2" />
+<text  x="1609.74" y="239.5" ></text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::PosixEventEngine::PollerWorkInternal(std::shared_ptr&lt;grpc_event_engine::experimental::P (150 samples, 0.52%)</title><rect x="1692.8" y="293" width="9.3" height="15.0" fill="rgb(199,199,58)" rx="2" ry="2" />
+<text  x="1695.80" y="303.5" ></text>
+</g>
+<g >
+<title>absl::synchronization_internal::FutexWaiter::Poke() (80 samples, 0.28%)</title><rect x="1735.5" y="277" width="5.0" height="15.0" fill="rgb(213,213,63)" rx="2" ry="2" />
+<text  x="1738.52" y="287.5" ></text>
+</g>
+<g >
+<title>[libc.so.6 internal] (26,000 samples, 90.43%)</title><rect x="10.6" y="373" width="1609.8" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="13.62" y="383.5" >[libc.so.6 internal]</text>
+</g>
+<g >
+<title>syscall (40 samples, 0.14%)</title><rect x="1738.0" y="261" width="2.5" height="15.0" fill="rgb(232,97,97)" rx="2" ry="2" />
+<text  x="1740.99" y="271.5" ></text>
+</g>
+<g >
+<title>std::chrono::_V2::steady_clock::now() (20 samples, 0.07%)</title><rect x="1741.7" y="277" width="1.2" height="15.0" fill="rgb(198,198,58)" rx="2" ry="2" />
+<text  x="1744.71" y="287.5" ></text>
+</g>
+<g >
+<title>sendmsg (20 samples, 0.07%)</title><rect x="1785.7" y="133" width="1.2" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="1788.67" y="143.5" ></text>
+</g>
+<g >
+<title>WAL::ReadUnlocked(unsigned long) const (140 samples, 0.49%)</title><rect x="1250.1" y="261" width="8.7" height="15.0" fill="rgb(207,207,61)" rx="2" ry="2" />
+<text  x="1253.12" y="271.5" ></text>
+</g>
+<g >
+<title>void absl::internal_any_invocable::LocalInvoker&lt;false, void, grpc_event_engine::experimental::(anonymous namespace)::Eve (510 samples, 1.77%)</title><rect x="1755.3" y="277" width="31.6" height="15.0" fill="rgb(204,204,60)" rx="2" ry="2" />
+<text  x="1758.33" y="287.5" >vo..</text>
+</g>
+<g >
+<title>absl::Mutex::Wakeup(absl::base_internal::PerThreadSynch*) (120 samples, 0.42%)</title><rect x="1733.0" y="293" width="7.5" height="15.0" fill="rgb(199,199,58)" rx="2" ry="2" />
+<text  x="1736.04" y="303.5" ></text>
+</g>
+<g >
+<title>operator new(unsigned long) (20 samples, 0.07%)</title><rect x="1700.8" y="229" width="1.3" height="15.0" fill="rgb(231,95,95)" rx="2" ry="2" />
+<text  x="1703.85" y="239.5" ></text>
+</g>
+<g >
+<title>void absl::internal_any_invocable::RemoteInvoker&lt;false, void, grpc_event_engine::experimental::TimerManager::MainLoop(): (180 samples, 0.63%)</title><rect x="1702.1" y="309" width="11.1" height="15.0" fill="rgb(219,219,66)" rx="2" ry="2" />
+<text  x="1705.08" y="319.5" ></text>
+</g>
+<g >
+<title>RaftMeta::Save(std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const&amp;) const (170 samples, 0.59%)</title><rect x="1590.6" y="181" width="10.6" height="15.0" fill="rgb(181,181,52)" rx="2" ry="2" />
+<text  x="1593.64" y="191.5" ></text>
+</g>
+<g >
+<title>all (28,750 samples, 100%)</title><rect x="10.0" y="389" width="1780.0" height="15.0" fill="rgb(209,63,63)" rx="2" ry="2" />
+<text  x="13.00" y="399.5" ></text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::(anonymous namespace)::EndpointWrite(grpc_endpoint*, grpc_slice_buffer*, grpc_closure*, (50 samples, 0.17%)</title><rect x="1617.3" y="165" width="3.1" height="15.0" fill="rgb(179,179,51)" rx="2" ry="2" />
+<text  x="1620.26" y="175.5" ></text>
+</g>
+<g >
+<title>void unum::usearch::index_gt&lt;float, unsigned long, unsigned int, unum::usearch::aligned_allocator_gt&lt;char, 64ul&gt;, unum:: (740 samples, 2.57%)</title><rect x="1201.2" y="245" width="45.8" height="15.0" fill="rgb(224,224,67)" rx="2" ry="2" />
+<text  x="1204.21" y="255.5" >void..</text>
+</g>
+<g >
+<title>[raftvdb-node internal] (10 samples, 0.03%)</title><rect x="1010.5" y="261" width="0.6" height="15.0" fill="rgb(224,84,84)" rx="2" ry="2" />
+<text  x="1013.51" y="271.5" ></text>
+</g>
+<g >
+<title>gpr_free (10 samples, 0.03%)</title><rect x="1786.9" y="373" width="0.6" height="15.0" fill="rgb(221,80,80)" rx="2" ry="2" />
+<text  x="1789.90" y="383.5" ></text>
+</g>
+<g >
+<title>gRPC::ServerCallData (30 samples, 0.10%)</title><rect x="1614.2" y="69" width="1.8" height="15.0" fill="rgb(220,220,66)" rx="2" ry="2" />
+<text  x="1617.17" y="79.5" ></text>
+</g>
+<g >
+<title>absl::Mutex::UnlockSlow (160 samples, 0.56%)</title><rect x="1681.7" y="261" width="9.9" height="15.0" fill="rgb(180,180,51)" rx="2" ry="2" />
+<text  x="1684.65" y="271.5" ></text>
+</g>
+<g >
+<title>gRPC::WorkStealingThreadPool (200 samples, 0.70%)</title><rect x="1679.2" y="277" width="12.4" height="15.0" fill="rgb(193,193,56)" rx="2" ry="2" />
+<text  x="1682.18" y="287.5" ></text>
+</g>
+<g >
+<title>grpc_core::(anonymous namespace)::InitTransportClosure&lt;&amp;(write_action_begin_locked(grpc_core::RefCountedPtr&lt;grpc_chttp2_ (60 samples, 0.21%)</title><rect x="1616.6" y="181" width="3.8" height="15.0" fill="rgb(210,210,62)" rx="2" ry="2" />
+<text  x="1619.64" y="191.5" ></text>
+</g>
+<g >
+<title>fstatat (10 samples, 0.03%)</title><rect x="1599.9" y="117" width="0.6" height="15.0" fill="rgb(206,58,58)" rx="2" ry="2" />
+<text  x="1602.93" y="127.5" ></text>
+</g>
+<g >
+<title>syscall (20 samples, 0.07%)</title><rect x="1711.4" y="213" width="1.2" height="15.0" fill="rgb(232,97,97)" rx="2" ry="2" />
+<text  x="1714.37" y="223.5" ></text>
+</g>
+<g >
+<title>std::filesystem::status(std::filesystem::__cxx11::path const&amp;, std::error_code&amp;) (20 samples, 0.07%)</title><rect x="1599.3" y="133" width="1.2" height="15.0" fill="rgb(196,196,57)" rx="2" ry="2" />
+<text  x="1602.31" y="143.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.33 internal] (18,410 samples, 64.03%)</title><rect x="384.6" y="341" width="1139.8" height="15.0" fill="rgb(246,118,118)" rx="2" ry="2" />
+<text  x="387.57" y="351.5" >[libstdc++.so.6.0.33 internal]</text>
+</g>
+<g >
+<title>WAL::TermAtUnlocked(unsigned long) const (20 samples, 0.07%)</title><rect x="1603.0" y="165" width="1.3" height="15.0" fill="rgb(207,207,61)" rx="2" ry="2" />
+<text  x="1606.02" y="175.5" ></text>
+</g>
+<g >
+<title>grpc_core::promise_filter_detail::BaseCallData::Flusher::~Flusher() (90 samples, 0.31%)</title><rect x="1610.5" y="165" width="5.5" height="15.0" fill="rgb(209,209,62)" rx="2" ry="2" />
+<text  x="1613.45" y="175.5" ></text>
+</g>
+<g >
+<title>[libc.so.6 internal] (10 samples, 0.03%)</title><rect x="1179.5" y="245" width="0.7" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="1182.54" y="255.5" ></text>
+</g>
+<g >
+<title>gRPC::HandleRead (590 samples, 2.05%)</title><rect x="1750.4" y="293" width="36.5" height="15.0" fill="rgb(187,187,54)" rx="2" ry="2" />
+<text  x="1753.38" y="303.5" >gRP..</text>
+</g>
+<g >
+<title>gRPC::WorkStealingThreadPool (90 samples, 0.31%)</title><rect x="1696.5" y="245" width="5.6" height="15.0" fill="rgb(193,193,56)" rx="2" ry="2" />
+<text  x="1699.51" y="255.5" ></text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::PosixEndpointImpl::MaybeMakeReadSlices() (10 samples, 0.03%)</title><rect x="1754.7" y="261" width="0.6" height="15.0" fill="rgb(197,197,58)" rx="2" ry="2" />
+<text  x="1757.71" y="271.5" ></text>
+</g>
+<g >
+<title>RaftNode::StartElection() (100 samples, 0.35%)</title><rect x="1265.6" y="293" width="6.2" height="15.0" fill="rgb(189,189,55)" rx="2" ry="2" />
+<text  x="1268.60" y="303.5" ></text>
+</g>
+<g >
+<title>[raftvdb-node internal] (20 samples, 0.07%)</title><rect x="1523.2" y="309" width="1.2" height="15.0" fill="rgb(224,84,84)" rx="2" ry="2" />
+<text  x="1526.15" y="319.5" ></text>
+</g>
+<g >
+<title>RaftNode::AppendEntryLocked(LogEntry const&amp;) (30 samples, 0.10%)</title><rect x="1269.9" y="261" width="1.9" height="15.0" fill="rgb(182,182,52)" rx="2" ry="2" />
+<text  x="1272.93" y="271.5" ></text>
+</g>
+<g >
+<title>RaftNode::HandleRequestVote(raftvdb::proto::RequestVoteRequest const&amp;) (440 samples, 1.53%)</title><rect x="1577.0" y="229" width="27.3" height="15.0" fill="rgb(175,175,50)" rx="2" ry="2" />
+<text  x="1580.02" y="239.5" >R..</text>
+</g>
+<g >
+<title>std::chrono::_V2::steady_clock::now() (60 samples, 0.21%)</title><rect x="1519.4" y="293" width="3.8" height="15.0" fill="rgb(198,198,58)" rx="2" ry="2" />
+<text  x="1522.44" y="303.5" ></text>
+</g>
+<g >
+<title>[raftvdb-node internal] (10 samples, 0.03%)</title><rect x="1372.1" y="293" width="0.6" height="15.0" fill="rgb(224,84,84)" rx="2" ry="2" />
+<text  x="1375.09" y="303.5" ></text>
+</g>
+<g >
+<title>std::filesystem::create_directories(std::filesystem::__cxx11::path const&amp;) (40 samples, 0.14%)</title><rect x="1598.1" y="165" width="2.4" height="15.0" fill="rgb(183,183,53)" rx="2" ry="2" />
+<text  x="1601.07" y="175.5" ></text>
+</g>
+<g >
+<title>HNSW::index_dense (30 samples, 0.10%)</title><rect x="1008.7" y="261" width="1.8" height="15.0" fill="rgb(187,187,54)" rx="2" ry="2" />
+<text  x="1011.66" y="271.5" ></text>
+</g>
+<g >
+<title>[libgp-collector.so internal] (22,980 samples, 79.93%)</title><rect x="197.6" y="357" width="1422.8" height="15.0" fill="rgb(209,64,64)" rx="2" ry="2" />
+<text  x="200.60" y="367.5" >[libgp-collector.so internal]</text>
+</g>
+<g >
+<title>absl::base_internal::CurrentThreadIdentityIfPresent() (10 samples, 0.03%)</title><rect x="1712.6" y="261" width="0.6" height="15.0" fill="rgb(202,202,60)" rx="2" ry="2" />
+<text  x="1715.61" y="271.5" ></text>
+</g>
+<g >
+<title>absl::FutexWaiter::WaitUntil (60 samples, 0.21%)</title><rect x="1726.2" y="261" width="3.7" height="15.0" fill="rgb(195,195,57)" rx="2" ry="2" />
+<text  x="1729.23" y="271.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.33 internal] (10 samples, 0.03%)</title><rect x="1742.3" y="261" width="0.6" height="15.0" fill="rgb(246,118,118)" rx="2" ry="2" />
+<text  x="1745.33" y="271.5" ></text>
+</g>
+<g >
+<title>HNSW::ip_distance (670 samples, 2.33%)</title><rect x="1138.1" y="229" width="41.4" height="15.0" fill="rgb(208,208,62)" rx="2" ry="2" />
+<text  x="1141.06" y="239.5" >HNS..</text>
+</g>
+<g >
+<title>gRPC::FilterStackCall (100 samples, 0.35%)</title><rect x="1764.6" y="229" width="6.2" height="15.0" fill="rgb(175,175,50)" rx="2" ry="2" />
+<text  x="1767.62" y="239.5" ></text>
+</g>
+<g >
+<title>unum::usearch::sorted_buffer_gt&lt;unum::usearch::index_gt&lt;float, unsigned long, unsigned int, unum::usearch::aligned_alloc (20 samples, 0.07%)</title><rect x="1185.1" y="245" width="1.2" height="15.0" fill="rgb(176,176,50)" rx="2" ry="2" />
+<text  x="1188.11" y="255.5" ></text>
+</g>
+<g >
+<title>fdatasync (10 samples, 0.03%)</title><rect x="1271.2" y="229" width="0.6" height="15.0" fill="rgb(229,92,92)" rx="2" ry="2" />
+<text  x="1274.17" y="239.5" ></text>
+</g>
+<g >
+<title>absl::CondVar::WaitCommon(absl::Mutex*, absl::synchronization_internal::KernelTimeout) [clone .cold] (170 samples, 0.59%)</title><rect x="1720.0" y="309" width="10.6" height="15.0" fill="rgb(211,211,63)" rx="2" ry="2" />
+<text  x="1723.04" y="319.5" ></text>
+</g>
+<g >
+<title>void grpc::internal::UnaryRunHandlerHelper&lt;google::protobuf::MessageLite&gt;(grpc::internal::MethodHandler::HandlerParamete (260 samples, 0.90%)</title><rect x="1604.3" y="261" width="16.1" height="15.0" fill="rgb(190,190,55)" rx="2" ry="2" />
+<text  x="1607.26" y="271.5" ></text>
+</g>
+<g >
+<title>absl::synchronization_internal::FutexWaiter::Poke() (80 samples, 0.28%)</title><rect x="1686.6" y="229" width="5.0" height="15.0" fill="rgb(213,213,63)" rx="2" ry="2" />
+<text  x="1689.61" y="239.5" ></text>
+</g>
+<g >
+<title>__vdso_clock_gettime (10 samples, 0.03%)</title><rect x="1522.5" y="261" width="0.7" height="15.0" fill="rgb(254,128,128)" rx="2" ry="2" />
+<text  x="1525.54" y="271.5" ></text>
+</g>
+<g >
+<title>read_action_parse_loop_locked(grpc_core::RefCountedPtr&lt;grpc_chttp2_transport&gt;, absl::Status) (80 samples, 0.28%)</title><rect x="1774.5" y="181" width="5.0" height="15.0" fill="rgb(181,181,52)" rx="2" ry="2" />
+<text  x="1777.52" y="191.5" ></text>
+</g>
+<g >
+<title>gRPC::WorkStealingThreadPool (2,430 samples, 8.45%)</title><rect x="1636.5" y="357" width="150.4" height="15.0" fill="rgb(193,193,56)" rx="2" ry="2" />
+<text  x="1639.46" y="367.5" >gRPC::WorkStealingT..</text>
+</g>
+<g >
+<title>void absl::internal_any_invocable::LocalInvoker&lt;false, void, grpc_event_engine::experimental::PosixEventEngine::PollerWo (170 samples, 0.59%)</title><rect x="1691.6" y="309" width="10.5" height="15.0" fill="rgb(176,176,50)" rx="2" ry="2" />
+<text  x="1694.56" y="319.5" ></text>
+</g>
+<g >
+<title>grpc_call_next_op(grpc_call_element*, grpc_transport_stream_op_batch*) (110 samples, 0.38%)</title><rect x="1609.2" y="197" width="6.8" height="15.0" fill="rgb(253,128,128)" rx="2" ry="2" />
+<text  x="1612.21" y="207.5" ></text>
+</g>
+<g >
+<title>grpc_core::(anonymous namespace)::InitTransportClosure&lt;&amp;(write_action_begin_locked(grpc_core::RefCountedPtr&lt;grpc_chttp2_ (120 samples, 0.42%)</title><rect x="1779.5" y="213" width="7.4" height="15.0" fill="rgb(210,210,62)" rx="2" ry="2" />
+<text  x="1782.47" y="223.5" ></text>
+</g>
+<g >
+<title>HNSW::ip_distance (20 samples, 0.07%)</title><rect x="1182.6" y="213" width="1.3" height="15.0" fill="rgb(208,208,62)" rx="2" ry="2" />
+<text  x="1185.63" y="223.5" ></text>
+</g>
+<g >
+<title>void absl::internal_any_invocable::LocalInvoker&lt;false, void, grpc_event_engine::experimental::PosixEndpointImpl::PosixEn (650 samples, 2.26%)</title><rect x="1746.7" y="309" width="40.2" height="15.0" fill="rgb(194,194,57)" rx="2" ry="2" />
+<text  x="1749.66" y="319.5" >voi..</text>
+</g>
+<g >
+<title>HNSW::invoke_metric (1,370 samples, 4.77%)</title><rect x="1094.7" y="245" width="84.8" height="15.0" fill="rgb(181,181,52)" rx="2" ry="2" />
+<text  x="1097.72" y="255.5" >HNSW::inv..</text>
+</g>
+<g >
+<title>syscall (30 samples, 0.10%)</title><rect x="1728.1" y="245" width="1.8" height="15.0" fill="rgb(232,97,97)" rx="2" ry="2" />
+<text  x="1731.09" y="255.5" ></text>
+</g>
+<g >
+<title>grpc_core::ExecCtx::Flush() (410 samples, 1.43%)</title><rect x="1761.5" y="245" width="25.4" height="15.0" fill="rgb(199,199,58)" rx="2" ry="2" />
+<text  x="1764.52" y="255.5" >g..</text>
+</g>
+<g >
+<title>absl::Mutex::UnlockSlow (40 samples, 0.14%)</title><rect x="1768.3" y="133" width="2.5" height="15.0" fill="rgb(180,180,51)" rx="2" ry="2" />
+<text  x="1771.33" y="143.5" ></text>
+</g>
+<g >
+<title>[libc.so.6 internal] (150 samples, 0.52%)</title><rect x="1510.2" y="277" width="9.2" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="1513.15" y="287.5" ></text>
+</g>
+<g >
+<title>grpc_combiner_continue_exec_ctx() (70 samples, 0.24%)</title><rect x="1616.0" y="197" width="4.4" height="15.0" fill="rgb(251,124,124)" rx="2" ry="2" />
+<text  x="1619.02" y="207.5" ></text>
+</g>
+<g >
+<title>malloc (10 samples, 0.03%)</title><rect x="1787.5" y="373" width="0.6" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="1790.52" y="383.5" ></text>
+</g>
+<g >
+<title>grpc_event_engine::experimental::TimerManager::MainLoop() (280 samples, 0.97%)</title><rect x="1674.2" y="309" width="17.4" height="15.0" fill="rgb(228,228,69)" rx="2" ry="2" />
+<text  x="1677.22" y="319.5" ></text>
+</g>
+<g >
+<title>gRPC::ServerCallData (100 samples, 0.35%)</title><rect x="1609.8" y="181" width="6.2" height="15.0" fill="rgb(220,220,66)" rx="2" ry="2" />
+<text  x="1612.83" y="191.5" ></text>
+</g>
+<g >
+<title>absl::FutexWaiter::WaitUntil (40 samples, 0.14%)</title><rect x="1710.1" y="229" width="2.5" height="15.0" fill="rgb(195,195,57)" rx="2" ry="2" />
+<text  x="1713.13" y="239.5" ></text>
+</g>
+<g >
+<title>RaftNode::LastLogTermLocked() (50 samples, 0.17%)</title><rect x="1601.2" y="213" width="3.1" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="1604.17" y="223.5" ></text>
+</g>
+<g >
+<title>pollset_work(grpc_pollset*, grpc_pollset_worker**, grpc_core::Timestamp) (40 samples, 0.14%)</title><rect x="1558.4" y="197" width="2.5" height="15.0" fill="rgb(175,175,50)" rx="2" ry="2" />
+<text  x="1561.45" y="207.5" ></text>
+</g>
+<g >
+<title>grpc::ThreadManager::MainWorkLoop() (1,310 samples, 4.56%)</title><rect x="1539.3" y="309" width="81.1" height="15.0" fill="rgb(188,188,54)" rx="2" ry="2" />
+<text  x="1542.25" y="319.5" >grpc::Thr..</text>
+</g>
+<g >
+<title>grpc::Server::SyncRequest::ContinueRunAfterInterception() (1,190 samples, 4.14%)</title><rect x="1546.7" y="293" width="73.7" height="15.0" fill="rgb(179,179,51)" rx="2" ry="2" />
+<text  x="1549.68" y="303.5" >grpc::Se..</text>
+</g>
+<g >
+<title>grpc::ThreadManager::WorkerThread::Run() (1,430 samples, 4.97%)</title><rect x="1531.8" y="325" width="88.6" height="15.0" fill="rgb(189,189,55)" rx="2" ry="2" />
+<text  x="1534.82" y="335.5" >grpc::Thre..</text>
+</g>
+<g >
+<title>sendmsg (10 samples, 0.03%)</title><rect x="1619.7" y="101" width="0.7" height="15.0" fill="rgb(248,120,120)" rx="2" ry="2" />
+<text  x="1622.74" y="111.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.33 internal] (10 samples, 0.03%)</title><rect x="1371.5" y="293" width="0.6" height="15.0" fill="rgb(246,118,118)" rx="2" ry="2" />
+<text  x="1374.47" y="303.5" ></text>
+</g>
+<g >
+<title>std::thread::run (15,510 samples, 53.95%)</title><rect x="564.1" y="325" width="960.3" height="15.0" fill="rgb(214,214,64)" rx="2" ry="2" />
+<text  x="567.12" y="335.5" >std::thread::run</text>
+</g>
+<g >
+<title>syscall (10 samples, 0.03%)</title><rect x="1700.2" y="165" width="0.6" height="15.0" fill="rgb(232,97,97)" rx="2" ry="2" />
+<text  x="1703.23" y="175.5" ></text>
+</g>
+<g >
+<title>grpc_chttp2_perform_read(grpc_chttp2_transport*, grpc_slice const&amp;, unsigned long&amp;) (70 samples, 0.24%)</title><rect x="1775.1" y="165" width="4.4" height="15.0" fill="rgb(235,102,102)" rx="2" ry="2" />
+<text  x="1778.14" y="175.5" ></text>
+</g>
+<g >
+<title>write (10 samples, 0.03%)</title><rect x="1600.5" y="165" width="0.7" height="15.0" fill="rgb(225,87,87)" rx="2" ry="2" />
+<text  x="1603.55" y="175.5" ></text>
+</g>
+<g >
+<title>operator new(unsigned long) (10 samples, 0.03%)</title><rect x="1788.8" y="373" width="0.6" height="15.0" fill="rgb(231,95,95)" rx="2" ry="2" />
+<text  x="1791.76" y="383.5" ></text>
+</g>
+<g >
+<title>grpc_core::Server::ChannelData::AcceptStream(void*, grpc_core::Transport*, void const*) (40 samples, 0.14%)</title><rect x="1777.0" y="117" width="2.5" height="15.0" fill="rgb(213,213,64)" rx="2" ry="2" />
+<text  x="1780.00" y="127.5" ></text>
+</g>
+<g >
+<title>[libc.so.6 internal] (10 samples, 0.03%)</title><rect x="1185.7" y="229" width="0.6" height="15.0" fill="rgb(254,129,129)" rx="2" ry="2" />
+<text  x="1188.73" y="239.5" ></text>
+</g>
+<g >
+<title>clock_nanosleep (80 samples, 0.28%)</title><rect x="1276.1" y="277" width="5.0" height="15.0" fill="rgb(228,91,91)" rx="2" ry="2" />
+<text  x="1279.12" y="287.5" ></text>
+</g>
+<g >
+<title>grpc_core::Server::AllocatingRequestMatcherRegistered::MatchOrQueue(unsigned long, grpc_core::Server::CallData*) (80 samples, 0.28%)</title><rect x="1765.9" y="197" width="4.9" height="15.0" fill="rgb(180,180,52)" rx="2" ry="2" />
+<text  x="1768.85" y="207.5" ></text>
+</g>
+<g >
+<title>grpc::ServerContextBase::CompletionOp::FinalizeResult(void**, bool*) (20 samples, 0.07%)</title><rect x="1554.1" y="277" width="1.2" height="15.0" fill="rgb(184,184,53)" rx="2" ry="2" />
+<text  x="1557.11" y="287.5" ></text>
+</g>
+<g >
+<title>RaftNode::MaintenanceLoop(std::stop_token) (50 samples, 0.17%)</title><rect x="1281.1" y="309" width="3.1" height="15.0" fill="rgb(223,223,67)" rx="2" ry="2" />
+<text  x="1284.07" y="319.5" ></text>
+</g>
+<g >
+<title>absl::synchronization_internal::KernelTimeout::SteadyClockNow() (30 samples, 0.10%)</title><rect x="1741.1" y="293" width="1.8" height="15.0" fill="rgb(184,184,53)" rx="2" ry="2" />
+<text  x="1744.09" y="303.5" ></text>
+</g>
+<g >
+<title>VectorIndex::Upsert(unsigned long, float const*, unsigned long) (5,240 samples, 18.23%)</title><rect x="922.6" y="277" width="324.4" height="15.0" fill="rgb(217,217,65)" rx="2" ry="2" />
+<text  x="925.60" y="287.5" >VectorIndex::Upsert(unsigned long, float co..</text>
+</g>
+<g >
+<title>RaftNode::CheckFollowerTimeouts() (40 samples, 0.14%)</title><rect x="1281.7" y="293" width="2.5" height="15.0" fill="rgb(210,210,62)" rx="2" ry="2" />
+<text  x="1284.69" y="303.5" ></text>
+</g>
+<g >
+<title>grpc_combiner_continue_exec_ctx() (260 samples, 0.90%)</title><rect x="1770.8" y="229" width="16.1" height="15.0" fill="rgb(251,124,124)" rx="2" ry="2" />
+<text  x="1773.81" y="239.5" ></text>
+</g>
+<g >
+<title>RaftNode::BecomeCandidate() (40 samples, 0.14%)</title><rect x="1266.8" y="277" width="2.5" height="15.0" fill="rgb(220,220,66)" rx="2" ry="2" />
+<text  x="1269.83" y="287.5" ></text>
+</g>
+<g >
+<title>RaftNode::BecomeFollower(unsigned long, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;  (310 samples, 1.08%)</title><rect x="1582.0" y="213" width="19.2" height="15.0" fill="rgb(223,223,67)" rx="2" ry="2" />
+<text  x="1584.97" y="223.5" ></text>
+</g>
+<g >
+<title>void grpc::internal::UnaryRunHandlerHelper&lt;google::protobuf::MessageLite&gt;(grpc::internal::MethodHandler::HandlerParamete (80 samples, 0.28%)</title><rect x="1556.0" y="261" width="4.9" height="15.0" fill="rgb(190,190,55)" rx="2" ry="2" />
+<text  x="1558.97" y="271.5" ></text>
+</g>
+<g >
+<title>unum::usearch::growing_hash_set_gt&lt;unsigned int, unum::usearch::hash_gt&lt;unsigned int&gt;, unum::usearch::aligned_allocator_ (20 samples, 0.07%)</title><rect x="1183.9" y="245" width="1.2" height="15.0" fill="rgb(203,203,60)" rx="2" ry="2" />
+<text  x="1186.87" y="255.5" ></text>
+</g>
+<g >
+<title>absl::synchronization_internal::KernelTimeout::KernelTimeout(absl::Duration) (40 samples, 0.14%)</title><rect x="1740.5" y="309" width="2.4" height="15.0" fill="rgb(199,199,58)" rx="2" ry="2" />
+<text  x="1743.47" y="319.5" ></text>
+</g>
+<g >
+<title>absl::Mutex::Wakeup(absl::base_internal::PerThreadSynch*) (120 samples, 0.42%)</title><rect x="1684.1" y="245" width="7.5" height="15.0" fill="rgb(199,199,58)" rx="2" ry="2" />
+<text  x="1687.13" y="255.5" ></text>
+</g>
+<g >
+<title>pthread_cond_clockwait (2,050 samples, 7.13%)</title><rect x="1372.7" y="293" width="126.9" height="15.0" fill="rgb(204,56,56)" rx="2" ry="2" />
+<text  x="1375.71" y="303.5" >pthread_cond_cl..</text>
+</g>
+<g >
+<title>RaftNode::ReplicationLoop(std::stop_token) (3,860 samples, 13.43%)</title><rect x="1284.2" y="309" width="239.0" height="15.0" fill="rgb(225,225,68)" rx="2" ry="2" />
+<text  x="1287.17" y="319.5" >RaftNode::ReplicationLoop(std::..</text>
+</g>
+</g>
+</svg>

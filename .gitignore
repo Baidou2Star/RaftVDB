@@ -35,3 +35,6 @@ install_manifest.txt
 *.tmp
 
 bench_run
+.claude
+.gitignore
+.codex
